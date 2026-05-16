@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hetzman"
+version = "3.1.0"
+description = "Hetzner Infrastructure Management Tool — DNS, NAT, IP pools, and Incus VMs over an etcd cluster"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "Khushil Dep", email = "khushil.dep@gmail.com" }]
+dependencies = [
+    "etcd3>=0.12",
+    # etcd3 0.12's generated protobuf stubs are incompatible with protobuf>=3.21.
+    # See https://github.com/kragniz/python-etcd3/issues/1280
+    "protobuf<3.21",
+    "typer>=0.12",
+    "rich>=13",
+]
+
+[project.scripts]
+hetzman = "hetzman.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
