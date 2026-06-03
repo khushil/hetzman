@@ -114,12 +114,15 @@ def remove_ip_from_interface(ip_address):
 
 
 def get_current_instances():
-    """Get all running instances with their IPs.
+    """Get all instances (any state) with their IPs.
 
-    Returns a dict {name: {ip, type, status}} on success (possibly empty if
-    there are genuinely no running instances), or None if the incus query
-    itself failed. Callers MUST treat None as "unknown" and skip reconciliation
-    so a transient incus error never prunes live DNS/NAT records.
+    Returns a dict {name: {ip, type, status}} on success (empty if there are
+    genuinely no instances), or None if the incus query itself failed. Callers
+    MUST treat None as "unknown" and skip reconciliation so a transient incus
+    error never prunes live DNS/NAT records. Instances in EVERY state are
+    included (ip is None when not running / no address yet) so a stopped
+    instance still counts as "existing" and keeps its DNS; only instances
+    actually deleted from Incus drop out of the map and have their DNS pruned.
     """
     try:
         result = subprocess.run(
@@ -135,20 +138,19 @@ def get_current_instances():
             status = instance.get('status', 'Unknown')
             instance_type = instance.get('type', 'unknown')
 
-            if status not in ['Running', 'Started']:
-                continue
-
-            # Get IP address
+            # Get IP address (None when not running or no address yet).
+            # Stopped instances are intentionally kept in the map (see docstring).
             ip_address = None
-            if 'state' in instance and 'network' in instance['state']:
-                # Check both eth0 (containers) and enp5s0 (VMs)
-                for iface in ['eth0', 'enp5s0']:
-                    if iface not in instance['state']['network']:
-                        continue
-                    for addr in instance['state']['network'][iface].get('addresses', []):
-                        if addr['family'] == 'inet' and not addr['address'].startswith('127.'):
-                            ip_address = addr['address']
-                            break
+            state = instance.get('state') or {}
+            network = state.get('network') or {}
+            # Check both eth0 (containers) and enp5s0 (VMs)
+            for iface in ['eth0', 'enp5s0']:
+                if iface not in network:
+                    continue
+                for addr in (network[iface].get('addresses') or []):
+                    if addr.get('family') == 'inet' and not addr.get('address', '').startswith('127.'):
+                        ip_address = addr['address']
+                        break
 
             instance_map[name] = {
                 'ip': ip_address,
@@ -340,7 +342,14 @@ def main():
 
             # Check for new or changed instances
             for name, info in current_instances.items():
-                # Handle VMs without IP yet
+                # Stopped/frozen/etc.: keep its existing DNS untouched (don't
+                # register and don't treat as pending). DNS is removed only when
+                # the instance is actually deleted (handled below).
+                if info['status'] not in ('Running', 'Started'):
+                    vms_pending_ip.pop(name, None)
+                    continue
+
+                # Handle running instances without an IP yet
                 if info['ip'] is None:
                     if info['type'] == 'virtual-machine':
                         if name not in vms_pending_ip:
