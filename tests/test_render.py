@@ -164,3 +164,13 @@ def test_split_save_rule_preserves_quoted_log_prefix():
     args = _split_save_rule('POSTROUTING -s 10.100.2.216/32 -j LOG --log-prefix "NAT-POST: "')
     assert args[-1] == "NAT-POST: "
     assert args[0] == "POSTROUTING"
+
+
+def test_netplan_routes_sorted_and_order_insensitive():
+    text = render_netplan_vswitch(SELF, FLEET)
+    doc = yaml.safe_load(text)
+    routes = doc["network"]["vlans"]["enp5s0.4000"]["routes"]
+    assert [r["to"] for r in routes] == sorted(r["to"] for r in routes)
+    reversed_doc = copy.deepcopy(doc)
+    reversed_doc["network"]["vlans"]["enp5s0.4000"]["routes"] = list(reversed(routes))
+    assert netplan_semantically_equal(text, yaml.safe_dump(reversed_doc))

@@ -62,16 +62,16 @@ def dnsmasq_conf_lines_to_remove(conf_text: str, nodes: Dict[str, dict]) -> List
 # netplan
 
 def render_netplan_vswitch(self_node: dict, nodes: Dict[str, dict]) -> str:
-    routes = []
-    for name in sorted(nodes):
-        node = nodes[name]
-        if node["name"] == self_node["name"]:
-            continue
-        routes.append({
+    routes = [
+        {
             "to": node["bridge_subnet"],
             "via": node["vswitch_ip"],
             "metric": ROUTE_METRIC,
-        })
+        }
+        for node in nodes.values()
+        if node["name"] != self_node["name"]
+    ]
+    routes.sort(key=lambda r: r["to"])
     doc = {
         "network": {
             "version": 2,
@@ -89,11 +89,27 @@ def render_netplan_vswitch(self_node: dict, nodes: Dict[str, dict]) -> str:
     return yaml.safe_dump(doc, default_flow_style=False, sort_keys=False)
 
 
+def _normalize_netplan(doc):
+    """Sort route lists so list-order alone never reads as drift."""
+    if isinstance(doc, dict):
+        return {
+            key: (
+                sorted(value, key=lambda r: str(r.get("to", "")))
+                if key == "routes" and isinstance(value, list)
+                else _normalize_netplan(value)
+            )
+            for key, value in doc.items()
+        }
+    return doc
+
+
 def netplan_semantically_equal(text_a: str, text_b: str) -> bool:
-    """Formatting-insensitive comparison so a reformat never triggers a
-    needless fleet-wide ``netplan apply``."""
+    """Formatting/order-insensitive comparison so a reformat never triggers
+    a needless fleet-wide ``netplan apply``."""
     try:
-        return yaml.safe_load(text_a) == yaml.safe_load(text_b)
+        return _normalize_netplan(yaml.safe_load(text_a)) == _normalize_netplan(
+            yaml.safe_load(text_b)
+        )
     except yaml.YAMLError:
         return False
 

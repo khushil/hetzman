@@ -310,10 +310,32 @@ def _config_ini_differs(self_node: dict, all_ips: List[str]) -> bool:
     return False
 
 
+def _rule_variants(args: List[str]) -> List[List[str]]:
+    """A rule and its live-equivalent spellings.
+
+    The fleet's persisted rulesets predate this tool and use the legacy
+    ``-m state --state`` alias in places; it is functionally identical to
+    ``-m conntrack --ctstate`` but does not ``-C``-match it. Accept either
+    so we never stack a duplicate-equivalent rule; the canonical base file
+    stays modern and live state converges at the next boot restore.
+    """
+    variants = [args]
+    if "conntrack" in args:
+        legacy = list(args)
+        for old, new in (("-m", "-m"), ("conntrack", "state"), ("--ctstate", "--state")):
+            legacy = [new if a == old else a for a in legacy]
+        variants.append(legacy)
+    return variants
+
+
 def _iptables_live_missing(self_node: dict, nodes: Dict[str, dict]) -> List[Tuple[str, str, List[str]]]:
     missing = []
     for table, chain, args in base_ensure_rules(self_node, nodes):
-        if _run(["iptables", "-w", "5", "-t", table, "-C", chain, *args], timeout=10).returncode != 0:
+        present = any(
+            _run(["iptables", "-w", "5", "-t", table, "-C", chain, *variant], timeout=10).returncode == 0
+            for variant in _rule_variants(args)
+        )
+        if not present:
             missing.append((table, chain, args))
     return missing
 
