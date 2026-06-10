@@ -569,7 +569,8 @@ def _node_sync_run(apply: bool) -> int:
                 errors.append(f"{dest}: {e}")
         _run(["systemctl", "daemon-reload"])
         for unit in ENABLE_UNITS:
-            _run(["systemctl", "enable", unit])
+            # --now also starts timers; for already-active services it's a no-op.
+            _run(["systemctl", "enable", "--now", unit])
         if "hetzman-instance-watcher.service" in systemd_changed:
             _run(["systemctl", "restart", "hetzman-instance-watcher"])
         changed.append("systemd")
