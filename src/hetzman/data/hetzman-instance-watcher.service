@@ -1,0 +1,18 @@
+[Unit]
+Description=HetzMan Incus Instance Watcher (ETCD)
+After=incus.service network-online.target etcd.service
+Wants=network-online.target
+Requires=incus.service etcd.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/bin/hetzman-instance-watcher
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

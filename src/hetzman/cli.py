@@ -6,7 +6,9 @@ from .apps import app
 # Import command modules so their @app.command decorators register.
 from .commands import dns  # noqa: F401
 from .commands import etcd_admin  # noqa: F401
+from .commands import fleet  # noqa: F401
 from .commands import ip  # noqa: F401
+from .commands import node  # noqa: F401
 from .commands import port  # noqa: F401
 from .commands import system  # noqa: F401
 from .commands import vm  # noqa: F401

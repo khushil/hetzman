@@ -1,0 +1,8 @@
+[Unit]
+Description=HetzMan node health report (heartbeat to etcd)
+After=network-online.target etcd.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hetzman health-report

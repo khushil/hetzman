@@ -1,7 +1,7 @@
 import json
 import os
 import subprocess
-from typing import Optional
+from typing import Dict, Optional, Set, Tuple
 
 import typer
 
@@ -9,6 +9,7 @@ from ..apps import app
 from ..config import get_etcd_client, get_settings
 from ..console import console
 from ..etcd_kv import get_all_with_prefix
+from ..locking import sync_lock
 from ..logging import log_message
 from ..network import (
     apply_nat_rules,
@@ -21,60 +22,109 @@ from ..services import restart_instance_watcher
 from ..vm_helpers import secure_vm_instance
 
 
+def do_sync_apply(restart_watcher: bool = True) -> bool:
+    """Reconcile NAT/DNS state from etcd onto this node.
+
+    Callable in-process (watcher, node-sync) with ``restart_watcher=False``
+    so the watcher never kills its own systemd unit mid-loop.
+    """
+    with sync_lock() as acquired:
+        if not acquired:
+            console.print("[yellow]Another sync is in progress; skipping[/yellow]")
+            log_message("sync-apply skipped: lock held", "INFO")
+            return True
+
+        console.print("[cyan]Regenerating configuration and applying rules...[/cyan]")
+        success = True
+        current_server = get_settings().current_server
+
+        # Clean up orphaned IPs.
+        try:
+            nat_rules = get_all_with_prefix(f"/hetzman/nat/{current_server}/")
+            active_ips = {
+                rule["public_ip"]
+                for rule in nat_rules.values()
+                if rule.get("enabled", True)
+            }
+
+            ip_pool = get_all_with_prefix("/hetzman/ip-pool/")
+            pool_ips = [
+                key.replace("/hetzman/ip-pool/", "")
+                for key, data in ip_pool.items()
+                if data.get("server") == current_server
+            ]
+
+            for pool_ip in pool_ips:
+                if get_public_ip_from_interface(pool_ip) and pool_ip not in active_ips:
+                    console.print(f"[yellow]Removing orphaned IP {pool_ip} from interface[/yellow]")
+                    remove_ip_from_interface(pool_ip)
+
+        except Exception as e:
+            console.print(f"[yellow]Warning: Could not clean orphaned IPs: {e}[/yellow]")
+
+        if not regenerate_hosts_file():
+            success = False
+
+        if not reload_dnsmasq():
+            success = False
+
+        if not apply_nat_rules():
+            success = False
+
+        try:
+            subprocess.run(
+                ["sudo", "netfilter-persistent", "save"],
+                capture_output=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            console.print("[yellow]Warning: Could not save iptables rules[/yellow]")
+
+        if success:
+            console.print("[green]Configuration applied successfully[/green]")
+        else:
+            console.print("[red]Some operations failed. Check logs.[/red]")
+
+    if restart_watcher:
+        restart_instance_watcher()
+    return success
+
+
+def compute_audit() -> Tuple[Dict[str, str], Set[str], Dict[str, str]]:
+    """Compare desired public-IP state (etcd) with the interface.
+
+    Returns (missing {ip: instance}, orphaned {ip}, correct {ip: instance}).
+    """
+    current_server = get_settings().current_server
+    nat_rules = get_all_with_prefix(f"/hetzman/nat/{current_server}/")
+    should_be_active = {
+        rule["public_ip"]: rule["instance_name"]
+        for rule in nat_rules.values()
+        if rule.get("enabled", True)
+    }
+
+    ip_pool = get_all_with_prefix("/hetzman/ip-pool/")
+    pool_ips = [
+        key.replace("/hetzman/ip-pool/", "")
+        for key, data in ip_pool.items()
+        if data.get("server") == current_server
+    ]
+
+    currently_active = {pool_ip for pool_ip in pool_ips if get_public_ip_from_interface(pool_ip)}
+
+    missing = {
+        ip: name for ip, name in should_be_active.items() if ip not in currently_active
+    }
+    orphaned = currently_active - set(should_be_active.keys())
+    correct = {
+        ip: name for ip, name in should_be_active.items() if ip in currently_active
+    }
+    return missing, orphaned, correct
+
+
 @app.command()
 def sync_apply():
     """Regenerate configuration files and apply all rules"""
-    console.print("[cyan]Regenerating configuration and applying rules...[/cyan]")
-    success = True
-    current_server = get_settings().current_server
-
-    # Clean up orphaned IPs.
-    try:
-        nat_rules = get_all_with_prefix(f"/hetzman/nat/{current_server}/")
-        active_ips = {
-            rule["public_ip"]
-            for rule in nat_rules.values()
-            if rule.get("enabled", True)
-        }
-
-        ip_pool = get_all_with_prefix("/hetzman/ip-pool/")
-        pool_ips = [
-            key.replace("/hetzman/ip-pool/", "")
-            for key, data in ip_pool.items()
-            if data.get("server") == current_server
-        ]
-
-        for pool_ip in pool_ips:
-            if get_public_ip_from_interface(pool_ip) and pool_ip not in active_ips:
-                console.print(f"[yellow]Removing orphaned IP {pool_ip} from interface[/yellow]")
-                remove_ip_from_interface(pool_ip)
-
-    except Exception as e:
-        console.print(f"[yellow]Warning: Could not clean orphaned IPs: {e}[/yellow]")
-
-    if not regenerate_hosts_file():
-        success = False
-
-    if not reload_dnsmasq():
-        success = False
-
-    if not apply_nat_rules():
-        success = False
-
-    try:
-        subprocess.run(
-            ["sudo", "netfilter-persistent", "save"],
-            capture_output=True, timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
-        console.print("[yellow]Warning: Could not save iptables rules[/yellow]")
-
-    if success:
-        console.print("[green]Configuration applied successfully[/green]")
-    else:
-        console.print("[red]Some operations failed. Check logs.[/red]")
-
-    restart_instance_watcher()
+    do_sync_apply(restart_watcher=True)
 
 
 @app.command()
@@ -131,34 +181,16 @@ def audit():
     console.print(f"\n[bold cyan]IP Interface Audit - {current_server}[/bold cyan]\n")
 
     try:
-        nat_rules = get_all_with_prefix(f"/hetzman/nat/{current_server}/")
-        should_be_active = {
-            rule["public_ip"]: rule["instance_name"]
-            for rule in nat_rules.values()
-            if rule.get("enabled", True)
-        }
-
-        ip_pool = get_all_with_prefix("/hetzman/ip-pool/")
-        pool_ips = [
-            key.replace("/hetzman/ip-pool/", "")
-            for key, data in ip_pool.items()
-            if data.get("server") == current_server
-        ]
-
-        currently_active = {pool_ip for pool_ip in pool_ips if get_public_ip_from_interface(pool_ip)}
-
-        missing = set(should_be_active.keys()) - currently_active
-        orphaned = currently_active - set(should_be_active.keys())
-        correct = set(should_be_active.keys()) & currently_active
+        missing, orphaned, correct = compute_audit()
 
         console.print(f"[green]✓ Correct IPs on interface: {len(correct)}[/green]")
         for ip in sorted(correct):
-            console.print(f"  {ip} → {should_be_active[ip]}")
+            console.print(f"  {ip} → {correct[ip]}")
 
         if missing:
             console.print(f"\n[red]✗ Missing IPs: {len(missing)}[/red]")
             for ip in sorted(missing):
-                console.print(f"  {ip} → {should_be_active[ip]} [red]MISSING[/red]")
+                console.print(f"  {ip} → {missing[ip]} [red]MISSING[/red]")
             console.print("\n[yellow]Run 'sudo hetzman sync-apply' to fix[/yellow]")
 
         if orphaned:

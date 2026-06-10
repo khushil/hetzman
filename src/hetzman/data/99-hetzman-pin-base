@@ -1,0 +1,16 @@
+#!/bin/sh
+# Nodes may run host docker (e.g. KIND) alongside the hetzman stack. Docker
+# manages its own iptables dynamically and rebuilds them on daemon start, so
+# they must NOT be persisted. The stock save plugins write the *live* ruleset
+# (incl. docker) to /etc/iptables/rules.v{4,6}; this runs afterwards
+# (lexically last) and re-pins those files to the canonical hetzman base, so
+# a boot-time restore never loads stale docker rules. The base files are
+# rendered by `hetzman node-sync`; per-instance NAT is rebuilt from etcd by
+# sync-apply at boot.
+case "$1" in
+  save)
+    [ -f /etc/iptables/rules.v4.hetzman-base ] && cp -f /etc/iptables/rules.v4.hetzman-base /etc/iptables/rules.v4
+    [ -f /etc/iptables/rules.v6.hetzman-base ] && cp -f /etc/iptables/rules.v6.hetzman-base /etc/iptables/rules.v6
+    ;;
+esac
+exit 0

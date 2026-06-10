@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hetzman"
-version = "3.1.0"
+version = "3.2.0"
 description = "Hetzner Infrastructure Management Tool — DNS, NAT, IP pools, and Incus VMs over an etcd cluster"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,6 +21,10 @@ dependencies = [
 
 [project.scripts]
 hetzman = "hetzman.cli:app"
+hetzman-instance-watcher = "hetzman.watcher:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+hetzman = ["data/*"]

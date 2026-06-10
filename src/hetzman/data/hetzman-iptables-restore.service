@@ -1,0 +1,13 @@
+[Unit]
+Description=Restore HetzMan NAT/DNS state (sync-apply)
+After=network-online.target netfilter-persistent.service etcd.service dnsmasq.service
+Wants=network-online.target
+Requires=etcd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hetzman sync-apply
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

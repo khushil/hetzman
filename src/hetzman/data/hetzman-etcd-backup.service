@@ -1,0 +1,7 @@
+[Unit]
+Description=HetzMan etcd snapshot backup
+After=network-online.target etcd.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/hetzman-tooling/scripts/etcd-backup.sh

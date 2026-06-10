@@ -1,0 +1,14 @@
+#!/bin/sh
+# Zero-dependency surfacing of fleet health at SSH login (reads cached files
+# written by the hetzman health/node-sync timers; no etcd round-trip).
+SUMMARY=/var/lib/hetzman/last-health-summary.txt
+SYNC=/var/lib/hetzman/last-node-sync.json
+if [ -r "$SUMMARY" ]; then
+    echo
+    echo "hetzman health ($(stat -c %y "$SUMMARY" 2>/dev/null | cut -d. -f1)):"
+    cat "$SUMMARY"
+fi
+if [ -r "$SYNC" ]; then
+    echo "node-sync: $(cat "$SYNC")"
+fi
+exit 0
