@@ -188,6 +188,21 @@ def apply_nat_rules() -> bool:
                 "-j", "MASQUERADE",
             ], check=True, capture_output=True, timeout=10)
 
+        # Egress masquerade: private instances reach the internet via the
+        # host primary public interface. Anything destined OUTSIDE the
+        # internal 10.0.0.0/8 fabric is masqueraded to the host IP. Public-IP
+        # VMs are unaffected -- their per-instance SNAT rules above are added
+        # first and match first; intra-fleet traffic hits the MASQUERADE above.
+        egress_check = subprocess.run([
+            "sudo", "iptables", "-w", "5", "-t", "nat", "-C", "HETZMAN_NAT_POST",
+            "-s", "10.100.0.0/16", "!", "-d", "10.0.0.0/8", "-j", "MASQUERADE",
+        ], capture_output=True, timeout=10)
+        if egress_check.returncode != 0:
+            subprocess.run([
+                "sudo", "iptables", "-w", "5", "-t", "nat", "-A", "HETZMAN_NAT_POST",
+                "-s", "10.100.0.0/16", "!", "-d", "10.0.0.0/8", "-j", "MASQUERADE",
+            ], check=True, capture_output=True, timeout=10)
+
         port_rules = get_all_with_prefix(f"/hetzman/port-forward/{settings.current_server}/")
 
         for _, rule in port_rules.items():
