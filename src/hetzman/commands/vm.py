@@ -28,6 +28,9 @@ def vm_create(
     disk: str = typer.Option("20GB", help="Disk size (e.g., 10GB)"),
     network: str = typer.Option("public", help="Network type: 'public' or 'private'"),
     port_forward: bool = typer.Option(False, "--port-forward", help="Add port forwards (for public IPs)"),
+    template: Optional[str] = typer.Option(
+        None, "--template", help="Provisioning template to apply (see 'hetzman vm cfg list')"
+    ),
 ):
     """Create, configure, and secure a new Incus VM"""
     if os.geteuid() != 0:
@@ -130,6 +133,25 @@ def vm_create(
             console.print("[red]Error: VM was created but security hardening failed.[/red]")
         else:
             console.print("[green]✓ VM security hardened.[/green]")
+
+        if template:
+            from ..templates import apply_template
+
+            console.print(f"Applying template '{template}'...")
+            try:
+                if apply_template(vm_name, template):
+                    console.print(f"[green]✓ Template '{template}' applied.[/green]")
+                else:
+                    console.print(
+                        f"[yellow]Template '{template}' applied with warnings.[/yellow]"
+                    )
+            except FileNotFoundError:
+                console.print(
+                    f"[yellow]Warning: template '{template}' not found "
+                    "(see 'hetzman vm cfg list'); VM created without it.[/yellow]"
+                )
+            except ValueError as exc:
+                console.print(f"[yellow]Warning: {exc}; VM created without the template.[/yellow]")
 
         console.print("Step 5/5: Done!")
         table = Table(title=f"New VM Summary: {vm_name}")
@@ -299,11 +321,27 @@ def vm_change(
         raise typer.Exit(code=1)
 
 
-@cfg_app.command("install-defaults")
-def vm_cfg_defaults(
-    vm_name: str = typer.Argument(..., help="Name of the VM to configure"),
-):
-    """Install default tools (btop, iftop, git, gh)"""
+@cfg_app.command("list")
+def vm_cfg_list():
+    """List the available VM provisioning templates."""
+    from ..templates import list_templates
+
+    table = Table(title="VM templates")
+    table.add_column("Template", style="cyan")
+    table.add_column("Description", style="green")
+    templates = list_templates()
+    if not templates:
+        console.print("[yellow]No templates found.[/yellow]")
+        return
+    for name, desc in templates:
+        table.add_row(name, desc)
+    console.print(table)
+
+
+def _apply_template_to_vm(vm_name: str, template: str) -> None:
+    """Shared body for `cfg apply` and `vm create --template`. Exits non-zero on failure."""
+    from ..templates import apply_template
+
     if os.geteuid() != 0:
         console.print("[red]Error: This command must be run as root (or with sudo).[/red]")
         raise typer.Exit(code=1)
@@ -312,29 +350,39 @@ def vm_cfg_defaults(
         console.print(f"[red]Error: VM or container '{vm_name}' not found.[/red]")
         raise typer.Exit(code=1)
 
-    console.print(f"[cyan]Installing default software on {vm_name}...[/cyan]")
-
-    if not run_vm_exec(vm_name, ["apt-get", "update", "-y"], "Updating apt cache"):
+    try:
+        ok = apply_template(vm_name, template)
+    except FileNotFoundError:
+        console.print(
+            f"[red]Error: template '{template}' not found. Try 'hetzman vm cfg list'.[/red]"
+        )
+        raise typer.Exit(code=1)
+    except ValueError as exc:
+        console.print(f"[red]Error: {exc}[/red]")
         raise typer.Exit(code=1)
 
-    if not run_vm_exec(
-        vm_name,
-        ["apt-get", "install", "-y", "iftop", "btop", "git", "curl", "ca-certificates"],
-        "Installing apt-utils (iftop, btop, git, curl)",
-    ):
-        console.print("[yellow]Warning: could not install all apt packages. Continuing...[/yellow]")
+    if ok:
+        console.print(f"[green]✓ Template '{template}' applied to {vm_name}[/green]")
+    else:
+        console.print(
+            f"[yellow]Template '{template}' applied to {vm_name} with warnings "
+            "(one or more optional steps failed).[/yellow]"
+        )
+        raise typer.Exit(code=1)
 
-    console.print("[bold]Installing GitHub CLI (gh) system-wide...[/bold]")
-    gh_install_script = (
-        "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg "
-        "| dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && "
-        "chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && "
-        "echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] "
-        "https://cli.github.com/packages stable main\" > /etc/apt/sources.list.d/github-cli.list && "
-        "apt-get update -y && "
-        "apt-get install gh -y"
-    )
-    if not run_vm_exec(vm_name, ["bash", "-c", gh_install_script], "Running gh install script", timeout=300):
-        console.print("[yellow]Warning: Could not install GitHub CLI (gh).[/yellow]")
 
-    console.print(f"[green]✓ Default software installation complete for {vm_name}[/green]")
+@cfg_app.command("apply")
+def vm_cfg_apply(
+    template: str = typer.Argument(..., help="Template name (see 'hetzman vm cfg list')"),
+    vm_name: str = typer.Argument(..., help="Name of the VM to configure"),
+):
+    """Apply a provisioning template's software to a VM (idempotent)."""
+    _apply_template_to_vm(vm_name, template)
+
+
+@cfg_app.command("install-defaults")
+def vm_cfg_defaults(
+    vm_name: str = typer.Argument(..., help="Name of the VM to configure"),
+):
+    """Install default tools (btop, iftop, git, curl, gh) — alias for the 'defaults' template."""
+    _apply_template_to_vm(vm_name, "defaults")

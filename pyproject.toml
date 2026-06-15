@@ -28,4 +28,4 @@ hetzman-instance-watcher = "hetzman.watcher:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-hetzman = ["data/*"]
+hetzman = ["data/*", "templates/*.yaml"]

@@ -1,0 +1,153 @@
+description: Curated Azure DevOps CI agent toolset (matches what MLE/training pipelines use).
+
+# Curated, NOT a literal mirror of the Microsoft-hosted ubuntu-24.04 image. The pipelines use
+# only: Python 3.12 (UsePythonVersion@0), a C/PostgreSQL build toolchain (psycopg/cryptography/
+# numpy), git/git-lfs, make, the docker engine (nightly lane), and a handful of CLIs. Everything
+# else (ruff/pytest/mle/uv/pip-audit) arrives via `pip install -e ".[dev]"` inside each job.
+#
+# Every step below is idempotent (guarded by command -v / test -e), so re-applying is safe.
+# Vendor tools are installed via their apt repositories (auditable GPG key + repo + apt install)
+# rather than `curl | bash`, so no opaque remote script runs as root.
+
+apt:
+  # C / PostgreSQL / Python build toolchain (compiles psycopg, cryptography, numpy wheels).
+  - build-essential
+  - libpq-dev
+  - python3-dev
+  - python3.12-venv
+  - pkg-config
+  # VCS + large-file support + build driver.
+  - git
+  - git-lfs
+  - make
+  # Pipeline utilities + linters used directly by jobs.
+  - jq
+  - yamllint
+  - shellcheck
+  - unzip
+  - curl
+  - ca-certificates
+  # Carried over from the baseline for parity with `defaults`.
+  - btop
+  - iftop
+
+scripts:
+  - name: git-lfs-system-install
+    required: false
+    timeout: 120
+    run: |
+      set -e
+      git lfs install --system
+
+  - name: github-cli
+    required: false
+    timeout: 300
+    run: |
+      set -e
+      command -v gh >/dev/null 2>&1 && { echo "gh present"; exit 0; }
+      curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+      chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list
+      apt-get update -y
+      apt-get install gh -y
+
+  - name: azure-cli
+    required: false
+    timeout: 420
+    run: |
+      set -e
+      command -v az >/dev/null 2>&1 && { echo "az present"; exit 0; }
+      mkdir -p /etc/apt/keyrings
+      curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+        | gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg
+      chmod go+r /etc/apt/keyrings/microsoft.gpg
+      AZ_DIST="$(lsb_release -cs)"
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ ${AZ_DIST} main" \
+        > /etc/apt/sources.list.d/azure-cli.list
+      apt-get update -y
+      apt-get install azure-cli -y
+
+  - name: yq-binary
+    required: false
+    timeout: 120
+    run: |
+      set -e
+      YQ_VERSION=v4.44.3
+      if command -v yq >/dev/null 2>&1 && yq --version 2>/dev/null | grep -q "${YQ_VERSION}"; then
+        echo "yq ${YQ_VERSION} present"; exit 0
+      fi
+      ARCH="$(dpkg --print-architecture)"
+      curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${ARCH}" \
+        -o /usr/local/bin/yq
+      chmod 0755 /usr/local/bin/yq
+      yq --version
+
+  - name: docker-engine
+    required: false
+    timeout: 600
+    run: |
+      set -e
+      if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+        echo "docker engine + compose plugin present"; exit 0
+      fi
+      install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+        -o /etc/apt/keyrings/docker.asc
+      chmod a+r /etc/apt/keyrings/docker.asc
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "${VERSION_CODENAME}") stable" \
+        > /etc/apt/sources.list.d/docker.list
+      apt-get update -y
+      apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+      # let the agent user (ubuntu) drive docker without sudo
+      getent group docker >/dev/null && usermod -aG docker ubuntu || true
+      systemctl enable --now docker || true
+
+  - name: python-toolcache
+    required: false
+    timeout: 600
+    run: |
+      set -e
+      # The Azure DevOps UsePythonVersion@0 task resolves Pythons under $AGENT_TOOLSDIRECTORY
+      # (it does NOT auto-download on self-hosted agents). Provision /opt/hostedtoolcache and a
+      # 3.12 build from the actions/python-versions registry, whose setup.sh honours
+      # AGENT_TOOLSDIRECTORY and writes the x64.complete marker itself. Idempotent: skips the
+      # ~120 MB download if a 3.12 build is already complete.
+      #
+      # Wiring the AGENT_TOOLSDIRECTORY env var INTO the running agent is install-dir specific
+      # (the agent's runsvc.sh, not present on a bare VM), so it is done at agent-install time,
+      # not here. See docs: append `export AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache` to the
+      # agent's runsvc.sh env hook (the systemd unit does not load .env).
+      TC=/opt/hostedtoolcache
+      mkdir -p "$TC"
+      export AGENT_TOOLSDIRECTORY="$TC"
+      if ! ls "$TC"/Python/3.12.*/x64.complete >/dev/null 2>&1; then
+        URL=$(python3 - <<'PY'
+      import json, urllib.request
+      m = json.load(urllib.request.urlopen("https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json"))
+      best = None
+      for e in m:
+          if not e["version"].startswith("3.12."):
+              continue
+          if e.get("stable") is not True:
+              continue
+          for f in e["files"]:
+              if f["platform"] == "linux" and f["arch"] == "x64" and f.get("platform_version") == "24.04":
+                  best = f["download_url"]
+                  break
+          if best:
+              break
+      assert best, "no 3.12 ubuntu-24.04 x64 build in manifest"
+      print(best)
+      PY
+      )
+        echo "downloading $URL"
+        rm -rf /tmp/pyx && mkdir -p /tmp/pyx
+        curl -fsSL "$URL" -o /tmp/py.tgz
+        tar -xzf /tmp/py.tgz -C /tmp/pyx
+        ( cd /tmp/pyx && bash setup.sh )
+        rm -rf /tmp/pyx /tmp/py.tgz
+      fi
+      chown -R ubuntu:ubuntu "$TC"
+      chmod 0775 "$TC"
