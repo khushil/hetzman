@@ -18,14 +18,32 @@ set -euo pipefail
 
 BAKE_CT="ci-agent-bake"
 IMAGE_ALIAS="ado-ci-agent"
-SRC_AGENT="${SRC_AGENT:-ado-agent-1}"   # copy the proven agent tarball from here
+# Seed the Python tool-cache + unpacked ADO agent from a source container. By default
+# we bootstrap a throwaway from the *current* ${IMAGE_ALIAS} image, so each re-bake
+# chains from the prior image and needs no VM/agent — the pool is self-sustaining once
+# the first image exists. Override SRC_AGENT=<running-container> to seed from a specific
+# source instead (how the very first image was bootstrapped, from a VM agent).
+SRC_AGENT="${SRC_AGENT:-}"
+BOOTSTRAP_SRC=""
+if [ -z "${SRC_AGENT}" ]; then
+  BOOTSTRAP_SRC="ci-agent-bake-src"
+  echo "==> [0/6] bootstrap seed container ${BOOTSTRAP_SRC} from image ${IMAGE_ALIAS}"
+  incus delete -f "${BOOTSTRAP_SRC}" >/dev/null 2>&1 || true
+  incus launch "local:${IMAGE_ALIAS}" "${BOOTSTRAP_SRC}" -c security.nesting=true >/dev/null
+  for _ in $(seq 1 30); do
+    incus exec "${BOOTSTRAP_SRC}" -- bash -lc 'test -f /home/ubuntu/azagent/agent.tar.gz' && break
+    sleep 1
+  done
+  SRC_AGENT="${BOOTSTRAP_SRC}"
+fi
+trap '[ -n "${BOOTSTRAP_SRC}" ] && incus delete -f "${BOOTSTRAP_SRC}" >/dev/null 2>&1 || true' EXIT
 
 echo "==> [1/6] fresh nesting container ${BAKE_CT}"
 incus delete -f "${BAKE_CT}" >/dev/null 2>&1 || true
 incus launch images:ubuntu/24.04 "${BAKE_CT}" \
   -c security.nesting=true -c limits.cpu=4 -c limits.memory=8GiB >/dev/null
 # wait for cloud-init / network
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
   incus exec "${BAKE_CT}" -- bash -lc 'getent hosts github.com >/dev/null 2>&1' && break
   sleep 2
 done

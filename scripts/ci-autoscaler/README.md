@@ -14,7 +14,7 @@ its scripts run **as root on dc12** (root-RCE surface → must be auditable and 
 
 | File | Role |
 |------|------|
-| `bake-ci-agent-image.sh` | Builds the lean `ado-ci-agent` Incus image (apt toolchain, gh/az/yq, docker-ce with nesting, Python tool-cache copied from a known-good agent, unpacked ADO agent 4.274.1 — *unregistered*). Deliberately omits the CONSTANCE BEAM/OTP build (unused by CI, ~20 min). |
+| `bake-ci-agent-image.sh` | Builds the lean `ado-ci-agent` Incus image (apt toolchain, gh/az/yq, docker-ce with nesting, Python tool-cache, unpacked ADO agent 4.274.1 — *unregistered*). By default it bootstraps its tool-cache + agent seed from a throwaway container of the *current* image, so each re-bake chains from the prior image with **no VM/agent dependency** (override `SRC_AGENT=<container>` to seed from a specific source, as the very first image did from a VM agent). Deliberately omits the CONSTANCE BEAM/OTP build (unused by CI, ~20 min). |
 | `ci-autoscaler.py` | The controller. Polls `pools/{id}/jobrequests`, scales `ci-agent-N` containers between `BASELINE` and `MAX_TOTAL`, reaps idle agents above baseline after a grace, and self-heals failed registrations (a container that never becomes an online pool agent within `REGISTER_GRACE_SECS` is reaped and relaunched). `flock` single-flight. |
 | `ci-autoscaler.service` | systemd oneshot wrapper around the controller. |
 | `ci-autoscaler.timer` | Fires the service every 30 s. |
