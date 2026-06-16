@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the ADO CI agent autoscaler every 30s
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=30
+AccuracySec=5
+Unit=ci-autoscaler.service
+
+[Install]
+WantedBy=timers.target

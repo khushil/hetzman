@@ -1,0 +1,11 @@
+[Unit]
+Description=Azure DevOps CI agent autoscaler (Incus containers, project-ci-pool)
+After=network-online.target incus.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/root/ci-autoscaler/env
+ExecStart=/usr/bin/python3 /root/ci-autoscaler/ci-autoscaler.py
+# never let a bad tick wedge the timer
+TimeoutStartSec=300
