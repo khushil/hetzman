@@ -1,18 +1,13 @@
-import json
-from datetime import datetime
 from typing import Optional
 
 import typer
 from rich.table import Table
 
 from ..apps import app
-from ..config import get_settings
 from ..console import console
+from ..core import dns as core_dns
 from ..core.reads import list_dns
-from ..etcd_kv import delete_key, get_all_with_prefix, put_key
-from ..logging import log_message
-from ..network import regenerate_hosts_file, reload_dnsmasq
-from ..services import restart_instance_watcher
+from ._render import drive
 
 
 @app.command()
@@ -22,26 +17,7 @@ def dns_add(
     instance: Optional[str] = typer.Option(None, help="Instance name"),
 ):
     """Add a DNS record manually"""
-    if "." not in hostname:
-        hostname = f"{hostname}.daemondreams.home.arpa"
-
-    record = {
-        "ip": ip,
-        "server": get_settings().current_server,
-        "instance": instance,
-        "type": None,
-        "auto": False,
-        "updated": datetime.now().isoformat(),
-    }
-
-    if put_key(f"/hetzman/dns/{hostname}", json.dumps(record)):
-        console.print(f"[green]Added DNS record: {hostname} -> {ip}[/green]")
-        log_message(f"Added DNS record: {hostname} -> {ip}")
-        regenerate_hosts_file()
-        reload_dnsmasq()
-        restart_instance_watcher()
-    else:
-        console.print("[red]Failed to add DNS record[/red]")
+    drive(core_dns.add_dns(hostname, ip, instance))
 
 
 @app.command()
@@ -49,17 +25,7 @@ def dns_remove(
     hostname: str = typer.Argument(..., help="Hostname to remove"),
 ):
     """Remove a DNS record"""
-    if "." not in hostname:
-        hostname = f"{hostname}.daemondreams.home.arpa"
-
-    if delete_key(f"/hetzman/dns/{hostname}"):
-        console.print(f"[green]Removed DNS record: {hostname}[/green]")
-        log_message(f"Removed DNS record: {hostname}")
-        regenerate_hosts_file()
-        reload_dnsmasq()
-        restart_instance_watcher()
-    else:
-        console.print(f"[yellow]DNS record not found: {hostname}[/yellow]")
+    drive(core_dns.remove_dns(hostname))
 
 
 @app.command()

@@ -1,18 +1,13 @@
-import json
-from datetime import datetime
 from typing import Optional
 
 import typer
 from rich.table import Table
 
 from ..apps import app
-from ..config import get_settings
 from ..console import console
+from ..core import ports as core_ports
 from ..core.reads import list_ports
-from ..etcd_kv import delete_key, get_key, put_key
-from ..logging import log_message
-from ..network import apply_nat_rules
-from ..services import restart_instance_watcher
+from ._render import drive
 
 
 @app.command()
@@ -24,49 +19,7 @@ def port_add(
     description: Optional[str] = typer.Option(None, help="Description"),
 ):
     """Add a port forward rule"""
-    if not (1 <= public_port <= 65535):
-        console.print(f"[red]Invalid public port: {public_port}[/red]")
-        return
-    if not (1 <= private_port <= 65535):
-        console.print(f"[red]Invalid private port: {private_port}[/red]")
-        return
-    if protocol not in ("tcp", "udp"):
-        console.print(f"[red]Invalid protocol: {protocol}[/red]")
-        return
-
-    current_server = get_settings().current_server
-
-    nat_data = get_key(f"/hetzman/nat/{current_server}/{instance}")
-    if not nat_data:
-        console.print(f"[red]Instance '{instance}' does not have a public IP assigned[/red]")
-        console.print("[yellow]Use 'hetzman ip-assign' first[/yellow]")
-        return
-
-    nat_rule = json.loads(nat_data)
-
-    port_key = f"/hetzman/port-forward/{current_server}/{instance}-{public_port}-{protocol}"
-    port_data = {
-        "public_ip": nat_rule["public_ip"],
-        "public_port": public_port,
-        "private_ip": nat_rule["private_ip"],
-        "private_port": private_port,
-        "protocol": protocol,
-        "instance_name": instance,
-        "description": description,
-        "enabled": True,
-        "created": datetime.now().isoformat(),
-    }
-
-    if put_key(port_key, json.dumps(port_data)):
-        console.print(
-            f"[green]Added port forward: {nat_rule['public_ip']}:{public_port} -> "
-            f"{nat_rule['private_ip']}:{private_port} ({protocol})[/green]"
-        )
-        log_message(f"Added port forward for {instance}")
-        apply_nat_rules()
-        restart_instance_watcher()
-    else:
-        console.print("[red]Failed to add port forward[/red]")
+    drive(core_ports.add_port(instance, public_port, private_port, protocol, description))
 
 
 @app.command()
@@ -76,16 +29,7 @@ def port_remove(
     protocol: str = typer.Option("tcp", help="Protocol (tcp/udp)"),
 ):
     """Remove a port forward rule"""
-    current_server = get_settings().current_server
-    port_key = f"/hetzman/port-forward/{current_server}/{instance}-{public_port}-{protocol}"
-
-    if delete_key(port_key):
-        console.print("[green]Removed port forward rule[/green]")
-        log_message(f"Removed port forward: {instance}:{public_port}/{protocol}")
-        apply_nat_rules()
-        restart_instance_watcher()
-    else:
-        console.print("[yellow]Port forward rule not found[/yellow]")
+    drive(core_ports.remove_port(instance, public_port, protocol))
 
 
 @app.command()
