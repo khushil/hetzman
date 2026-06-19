@@ -33,6 +33,7 @@ _MODULES_UNDER_TEST: list[str] = [
     "hetzman.core.privilege",
     "hetzman.core.models",
     "hetzman.core.concurrency",
+    "hetzman.core.reads",
     # decoupled low-level modules
     "hetzman.config",
     "hetzman.logging",

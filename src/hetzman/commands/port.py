@@ -8,7 +8,8 @@ from rich.table import Table
 from ..apps import app
 from ..config import get_settings
 from ..console import console
-from ..etcd_kv import delete_key, get_all_with_prefix, get_key, put_key
+from ..core.reads import list_ports
+from ..etcd_kv import delete_key, get_key, put_key
 from ..logging import log_message
 from ..network import apply_nat_rules
 from ..services import restart_instance_watcher
@@ -92,10 +93,9 @@ def port_list(
     instance: Optional[str] = typer.Option(None, help="Filter by instance"),
 ):
     """List port forward rules"""
-    current_server = get_settings().current_server
-    port_forwards = get_all_with_prefix(f"/hetzman/port-forward/{current_server}/")
+    rules = list_ports(instance=instance)
 
-    if not port_forwards:
+    if not rules:
         console.print("[yellow]No port forward rules found[/yellow]")
         return
 
@@ -107,16 +107,14 @@ def port_list(
     table.add_column("Description", style="white")
     table.add_column("Enabled", style="blue")
 
-    for _, rule in sorted(port_forwards.items()):
-        if instance and rule.get("instance_name") != instance:
-            continue
+    for rule in rules:
         table.add_row(
-            f"{rule['public_ip']}:{rule['public_port']}",
-            f"{rule['private_ip']}:{rule['private_port']}",
-            rule["protocol"],
-            rule["instance_name"],
-            rule.get("description", "-"),
-            "Yes" if rule.get("enabled", True) else "No",
+            f"{rule.public_ip}:{rule.public_port}",
+            f"{rule.private_ip}:{rule.private_port}",
+            rule.protocol,
+            rule.instance,
+            rule.description if rule.description is not None else "-",
+            "Yes" if rule.enabled else "No",
         )
 
     console.print(table)

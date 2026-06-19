@@ -10,7 +10,8 @@ from rich.table import Table
 from ..apps import app
 from ..config import get_settings
 from ..console import console
-from ..etcd_kv import delete_key, get_all_with_prefix, get_key, put_key
+from ..core.reads import list_ips
+from ..etcd_kv import delete_key, get_key, put_key
 from ..logging import log_message
 from ..network import (
     add_ip_to_interface,
@@ -26,11 +27,13 @@ def ip_list(
     available_only: bool = typer.Option(False, "--available", help="Show only available IPs"),
 ):
     """List public IP pool"""
-    ip_pool = get_all_with_prefix("/hetzman/ip-pool/")
+    all_ips = list_ips()
 
-    if not ip_pool:
+    if not all_ips:
         console.print("[yellow]No IPs found[/yellow]")
         return
+
+    allocations = list_ips(server=server, available_only=available_only)
 
     table = Table(title="Public IP Pool")
     table.add_column("IP Address", style="cyan")
@@ -38,22 +41,14 @@ def ip_list(
     table.add_column("Status", style="green")
     table.add_column("Assigned To", style="yellow")
 
-    for key, data in sorted(ip_pool.items()):
-        ip_address = key.replace("/hetzman/ip-pool/", "")
-
-        if server and data.get("server") != server:
-            continue
-        if available_only and data.get("status") != "available":
-            continue
-
-        status = data.get("status", "unknown")
-        status_color = "green" if status == "available" else "red"
+    for alloc in allocations:
+        status_color = "green" if alloc.status == "available" else "red"
 
         table.add_row(
-            ip_address,
-            data.get("server", ""),
-            f"[{status_color}]{status}[/{status_color}]",
-            data.get("assigned_to", "-"),
+            alloc.ip,
+            alloc.server,
+            f"[{status_color}]{alloc.status}[/{status_color}]",
+            alloc.assigned_to if alloc.assigned_to is not None else "-",
         )
 
     console.print(table)

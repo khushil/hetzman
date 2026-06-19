@@ -145,68 +145,43 @@ def fleet_status():
     """Show health of every node in the fleet (from etcd heartbeats)"""
     from rich.table import Table
 
-    nodes = load_registry()
-    health = {
-        key[len(HEALTH_PREFIX):]: value
-        for key, value in get_all_with_prefix(HEALTH_PREFIX).items()
-        if isinstance(value, dict)
-    }
+    from ..core.reads import get_fleet_status
 
-    try:
-        members = {m.name for m in get_etcd_client().members}
-    except Exception:
-        members = set()
+    fleet = get_fleet_status()
 
-    now = datetime.datetime.now()
-    degraded = False
-    table = Table(title=f"Fleet status ({len(nodes)} registered nodes)")
+    table = Table(title=f"Fleet status ({fleet.registered_node_count} registered nodes)")
     for column in ("Node", "Heartbeat", "Checks", "Peers", "Versions", "Sync", "Disk/Pool"):
         table.add_column(column)
 
-    for name in sorted(set(nodes) | set(health)):
-        beat = health.get(name)
-        if not beat:
-            table.add_row(name, "[red]DOWN (no heartbeat)[/red]", "-", "-", "-", "-", "-")
-            degraded = True
+    for node in fleet.nodes:
+        if not node.alive:
+            table.add_row(node.name, "[red]DOWN (no heartbeat)[/red]", "-", "-", "-", "-", "-")
             continue
 
-        age = "?"
-        try:
-            delta = now - datetime.datetime.fromisoformat(beat["ts"])
-            age = f"{int(delta.total_seconds())}s ago"
-        except (KeyError, ValueError):
-            pass
+        age = f"{node.heartbeat_age_s}s ago" if node.heartbeat_age_s is not None else "?"
 
-        checks = beat.get("checks", {})
-        flat = {k: v for k, v in checks.items() if isinstance(v, str)}
-        bad = [k for k, v in flat.items() if v not in ("ok",)]
-        peers = checks.get("peers", {})
-        bad_peers = [k for k, v in peers.items() if v != "ok"]
-        if bad or bad_peers:
-            degraded = True
+        version = node.hetzman_version
+        if not node.endpoint_count_ok:
+            version += (
+                f" [red](endpoints={node.endpoints_configured}"
+                f"!={fleet.registered_node_count})[/red]"
+            )
 
-        version = beat.get("hetzman_version", "?")
-        incus = beat.get("incus_version", "?")
-        endpoints = beat.get("endpoints_configured")
-        if nodes and endpoints != len(nodes):
-            degraded = True
-            version += f" [red](endpoints={endpoints}!={len(nodes)})[/red]"
+        disk_val = node.disk_root_pct if node.disk_root_pct is not None else "?"
+        pool_val = node.pool_pct if node.pool_pct is not None else "?"
 
-        sync = (beat.get("node_sync") or {}).get("result", "-")
         table.add_row(
-            name,
+            node.name,
             f"[green]{age}[/green]",
-            "[green]ok[/green]" if not bad else f"[red]{','.join(bad)}[/red]",
-            "[green]ok[/green]" if not bad_peers else f"[red]{','.join(bad_peers)}[/red]",
-            f"{version} / incus {incus}",
-            sync if sync != "error" else "[red]error[/red]",
-            f"{checks.get('disk_root_pct', '?')}% / {checks.get('btrfs_pool_pct', '?')}%",
+            "[green]ok[/green]" if not node.checks_bad else f"[red]{','.join(node.checks_bad)}[/red]",
+            "[green]ok[/green]" if not node.peers_bad else f"[red]{','.join(node.peers_bad)}[/red]",
+            f"{version} / incus {node.incus_version}",
+            node.sync_result if node.sync_result != "error" else "[red]error[/red]",
+            f"{disk_val}% / {pool_val}%",
         )
-        if name in nodes and nodes[name].get("etcd_name") not in members and members:
-            degraded = True
 
     console.print(table)
-    if degraded:
+    if fleet.degraded:
         console.print("[red]Fleet DEGRADED[/red]")
         raise typer.Exit(code=1)
     console.print("[green]Fleet healthy[/green]")

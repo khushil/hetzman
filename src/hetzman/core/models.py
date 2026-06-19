@@ -213,6 +213,11 @@ class FleetNodeStatus:
     pool_pct: int | None
     endpoint_count_ok: bool
     etcd_member_present: bool
+    # Raw endpoint count from the heartbeat (``endpoints_configured``); kept so
+    # the CLI can faithfully render the ``(endpoints=X!=Y)`` annotation where
+    # X is this value and Y is ``FleetStatus.registered_node_count``.  ``None``
+    # when the node has no heartbeat or the field is absent.
+    endpoints_configured: int | None = None
 
 
 @dataclass(frozen=True)
@@ -226,6 +231,12 @@ class FleetStatus:
     nodes: tuple[FleetNodeStatus, ...]
     degraded: bool
     member_names: frozenset[str]
+    # Number of nodes in the registry (``len(load_registry())``).  Distinct
+    # from ``len(nodes)`` because ``nodes`` is the union of registered nodes
+    # and nodes that have a heartbeat but no registry entry.  This is the ``Y``
+    # in the CLI's ``(endpoints=X!=Y)`` annotation and the title's
+    # "(N registered nodes)".
+    registered_node_count: int = 0
 
 
 # ---------------------------------------------------------------------------

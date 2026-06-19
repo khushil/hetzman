@@ -221,19 +221,19 @@ def node_list():
     """List registry entries"""
     from rich.table import Table
 
-    nodes = load_registry()
-    errors = validate_registry(nodes) if nodes else ["registry is empty"]
+    from ..core.reads import list_nodes
+
+    nodes, errors = list_nodes()
 
     table = Table(title=f"Fleet registry ({len(nodes)} nodes)")
     for column in ("Node", "vSwitch IP", "Bridge", "Public block", "etcd name", "Updated"):
         table.add_column(column)
-    for name in sorted(nodes):
-        node = nodes[name]
+    for node in nodes:
         table.add_row(
-            name, node.get("vswitch_ip", "?"),
-            f"{node.get('bridge_ip', '?')} ({node.get('bridge_subnet', '?')})",
-            node.get("public_block", "?"), node.get("etcd_name", "?"),
-            (node.get("updated_at") or "?")[:19],
+            node.name, node.vswitch_ip or "?",
+            f"{node.bridge_ip or '?'} ({node.bridge_subnet or '?'})",
+            node.public_block or "?", node.etcd_name or "?",
+            (node.updated_at or "?")[:19],
         )
     console.print(table)
     if errors:

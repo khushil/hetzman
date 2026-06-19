@@ -8,6 +8,7 @@ import typer
 from ..apps import app
 from ..config import get_etcd_client, get_settings
 from ..console import console
+from ..core.reads import get_system_status
 from ..etcd_kv import get_all_with_prefix
 from ..locking import sync_lock
 from ..logging import log_message
@@ -134,44 +135,25 @@ def status():
     console.print(f"\n[bold cyan]HetzMan Status - {current_server}[/bold cyan]\n")
 
     try:
-        dns_records = get_all_with_prefix("/hetzman/dns/")
-        my_dns = sum(1 for v in dns_records.values() if v.get("server") == current_server)
-        console.print(f"DNS Records: [green]{my_dns}[/green] (total: {len(dns_records)})")
-
-        types: dict = {}
-        for record in dns_records.values():
-            if record.get("server") == current_server and record.get("type"):
-                types[record["type"]] = types.get(record["type"], 0) + 1
-
-        for t, count in types.items():
-            console.print(f"  - {t}: {count}")
-
-        ip_pool = get_all_with_prefix("/hetzman/ip-pool/")
-        my_available = sum(
-            1 for v in ip_pool.values()
-            if v.get("server") == current_server and v.get("status") == "available"
-        )
-        my_total = sum(1 for v in ip_pool.values() if v.get("server") == current_server)
-        console.print(f"Available IPs: [green]{my_available}[/green] / {my_total}")
-
-        nat_rules = get_all_with_prefix(f"/hetzman/nat/{current_server}/")
-        active_nat = sum(1 for v in nat_rules.values() if v.get("enabled", True))
-        console.print(f"Active NAT Rules: [green]{active_nat}[/green]")
-
-        port_forwards = get_all_with_prefix(f"/hetzman/port-forward/{current_server}/")
-        active_ports = sum(1 for v in port_forwards.values() if v.get("enabled", True))
-        console.print(f"Active Port Forwards: [green]{active_ports}[/green]")
-
-        try:
-            members = get_etcd_client().members
-            console.print(f"ETCD Cluster: [green]{len(list(members))} members[/green]")
-        except Exception:
-            console.print("ETCD Cluster: [yellow]Unknown[/yellow]")
-
-        console.print()
-
+        st = get_system_status()
     except Exception as e:
         console.print(f"[red]Error getting status: {e}[/red]")
+        return
+
+    console.print(f"DNS Records: [green]{st.dns_mine}[/green] (total: {st.dns_total})")
+    for t, count in st.dns_types.items():
+        console.print(f"  - {t}: {count}")
+
+    console.print(f"Available IPs: [green]{st.ips_available}[/green] / {st.ips_total}")
+    console.print(f"Active NAT Rules: [green]{st.active_nat}[/green]")
+    console.print(f"Active Port Forwards: [green]{st.active_ports}[/green]")
+
+    if st.etcd_members is not None:
+        console.print(f"ETCD Cluster: [green]{st.etcd_members} members[/green]")
+    else:
+        console.print("ETCD Cluster: [yellow]Unknown[/yellow]")
+
+    console.print()
 
 
 @app.command()

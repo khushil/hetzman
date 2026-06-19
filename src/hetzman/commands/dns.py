@@ -8,6 +8,7 @@ from rich.table import Table
 from ..apps import app
 from ..config import get_settings
 from ..console import console
+from ..core.reads import list_dns
 from ..etcd_kv import delete_key, get_all_with_prefix, put_key
 from ..logging import log_message
 from ..network import regenerate_hosts_file, reload_dnsmasq
@@ -66,9 +67,9 @@ def dns_list(
     server: Optional[str] = typer.Option(None, help="Filter by server"),
 ):
     """List all DNS records"""
-    dns_records = get_all_with_prefix("/hetzman/dns/")
+    records = list_dns(server=server)
 
-    if not dns_records:
+    if not records:
         console.print("[yellow]No DNS records found[/yellow]")
         return
 
@@ -80,17 +81,14 @@ def dns_list(
     table.add_column("Type", style="blue")
     table.add_column("Auto", style="white")
 
-    for key, record in sorted(dns_records.items()):
-        hostname = key.replace("/hetzman/dns/", "")
-        if server and record.get("server") != server:
-            continue
+    for rec in records:
         table.add_row(
-            hostname,
-            record.get("ip", ""),
-            record.get("server", ""),
-            record.get("instance", "-"),
-            record.get("type", "-"),
-            "Yes" if record.get("auto", False) else "No",
+            rec.hostname,
+            rec.ip,
+            rec.server,
+            rec.instance or "-",
+            rec.type or "-",
+            "Yes" if rec.auto else "No",
         )
 
     console.print(table)
