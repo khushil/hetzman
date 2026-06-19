@@ -6,7 +6,6 @@ import subprocess
 from typing import List, Optional, Tuple
 
 from .config import HOST_ROOT_KEYS
-from .console import console
 from .logging import log_message
 
 
@@ -18,7 +17,7 @@ def run_vm_exec(
     user_id: Optional[str] = None,
 ) -> bool:
     """Run an ``incus exec`` command, log on failure."""
-    console.print(f"  {step_msg}...")
+    log_message(f"  {step_msg}...")
     base_cmd = ["sudo", "incus", "exec", vm_name]
     if user_id:
         base_cmd.extend(["--user", user_id])
@@ -30,11 +29,11 @@ def run_vm_exec(
         )
         return True
     except subprocess.CalledProcessError as e:
-        console.print(f"  [red]FAILED[/red]: {e.stderr[:200]}...")
+        log_message(f"  FAILED: {e.stderr[:200]}...", "ERROR")
         log_message(f"Failed to {step_msg.lower()} on {vm_name}: {e.stderr}", "ERROR")
         return False
     except Exception as e:
-        console.print(f"  [red]FAILED[/red]: {e}")
+        log_message(f"  FAILED: {e}", "ERROR")
         log_message(f"Failed to {step_msg.lower()} on {vm_name}: {e}", "ERROR")
         return False
 
@@ -95,17 +94,17 @@ def get_vm_users(vm_name: str) -> List[Tuple[str, str]]:
 def secure_vm_instance(vm_name: str) -> bool:
     """Install/harden SSH + fail2ban on a single VM."""
     if not check_vm_exists(vm_name):
-        console.print(f"Skipping {vm_name} (does not exist or not running).")
+        log_message(f"Skipping {vm_name} (does not exist or not running).")
         return False
 
-    console.print(f"--- [blue]Processing VM: {vm_name}[/blue] ---")
+    log_message(f"--- Processing VM: {vm_name} ---")
 
     if not os.path.exists(HOST_ROOT_KEYS):
-        console.print(f"[red]Error: Host key file not found at {HOST_ROOT_KEYS}[/red]")
+        log_message(f"Error: Host key file not found at {HOST_ROOT_KEYS}", "ERROR")
         return False
 
     try:
-        console.print("Step 1/8: Installing/Enabling openssh-server...")
+        log_message("Step 1/8: Installing/Enabling openssh-server...")
         subprocess.run(
             ["sudo", "incus", "exec", vm_name, "--", "apt-get", "update", "-y"],
             capture_output=True, text=True, timeout=120,
@@ -119,19 +118,19 @@ def secure_vm_instance(vm_name: str) -> bool:
             check=True, capture_output=True, text=True, timeout=30,
         )
 
-        console.print("Step 2/8: Ensuring /root/.ssh directory...")
+        log_message("Step 2/8: Ensuring /root/.ssh directory...")
         subprocess.run(
             ["sudo", "incus", "exec", vm_name, "--", "mkdir", "-p", "/root/.ssh"],
             check=True, capture_output=True, text=True, timeout=10,
         )
 
-        console.print("Step 3/8: Pushing authorized_keys...")
+        log_message("Step 3/8: Pushing authorized_keys...")
         subprocess.run(
             ["sudo", "incus", "file", "push", HOST_ROOT_KEYS, f"{vm_name}/root/.ssh/authorized_keys"],
             check=True, capture_output=True, text=True, timeout=10,
         )
 
-        console.print("Step 4/8: Setting permissions...")
+        log_message("Step 4/8: Setting permissions...")
         subprocess.run(
             ["sudo", "incus", "exec", vm_name, "--", "chmod", "700", "/root/.ssh"],
             check=True, capture_output=True, text=True, timeout=10,
@@ -145,7 +144,7 @@ def secure_vm_instance(vm_name: str) -> bool:
             check=True, capture_output=True, text=True, timeout=10,
         )
 
-        console.print("Step 5/8: Hardening sshd_config (key-only)...")
+        log_message("Step 5/8: Hardening sshd_config (key-only)...")
         sed_command = (
             "sed -i -e 's/^#*PermitRootLogin .*/PermitRootLogin prohibit-password/' "
             "-e 's/^#*PasswordAuthentication .*/PasswordAuthentication no/' "
@@ -157,19 +156,19 @@ def secure_vm_instance(vm_name: str) -> bool:
             check=True, capture_output=True, text=True, timeout=10,
         )
 
-        console.print("Step 6/8: Restarting sshd service...")
+        log_message("Step 6/8: Restarting sshd service...")
         subprocess.run(
             ["sudo", "incus", "exec", vm_name, "--", "systemctl", "restart", "ssh"],
             check=True, capture_output=True, text=True, timeout=10,
         )
 
-        console.print("Step 7/8: Installing fail2ban...")
+        log_message("Step 7/8: Installing fail2ban...")
         subprocess.run(
             ["sudo", "incus", "exec", vm_name, "--", "apt-get", "install", "fail2ban", "-y"],
             check=True, capture_output=True, text=True, timeout=120,
         )
 
-        console.print("Step 8/8: Configuring fail2ban...")
+        log_message("Step 8/8: Configuring fail2ban...")
         jail_local_content = (
             "[sshd]\n"
             "enabled = true\n"
@@ -187,15 +186,12 @@ def secure_vm_instance(vm_name: str) -> bool:
             check=True, capture_output=True, text=True, timeout=30,
         )
 
-        console.print(f"[green]✓ Successfully secured {vm_name}[/green]")
         log_message(f"Successfully secured {vm_name}", "INFO")
         return True
 
     except subprocess.CalledProcessError as e:
-        console.print(f"[red]Error securing {vm_name}: {e.stderr}[/red]")
         log_message(f"Failed to secure {vm_name}: {e.stderr}", "ERROR")
         return False
     except Exception as e:
-        console.print(f"[red]An unexpected error occurred while securing {vm_name}: {e}[/red]")
         log_message(f"An unexpected error occurred while securing {vm_name}: {e}", "ERROR")
         return False

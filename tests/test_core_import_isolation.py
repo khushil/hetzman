@@ -39,6 +39,11 @@ _MODULES_UNDER_TEST: list[str] = [
     "hetzman.logging",
     "hetzman.etcd_kv",
     "hetzman.locking",
+    # console-free utilities (decoupled in this phase)
+    "hetzman.network",
+    "hetzman.services",
+    "hetzman.templates",
+    "hetzman.vm_helpers",
 ]
 
 _PROBE = (

@@ -24,7 +24,7 @@ import subprocess
 
 import yaml
 
-from .console import console
+from .logging import log_message
 from .vm_helpers import run_vm_exec
 
 
@@ -79,7 +79,7 @@ def _set_role_label(vm_name: str, template: str) -> None:
             timeout=15,
         )
     except (subprocess.SubprocessError, OSError) as exc:
-        console.print(f"[yellow]Warning: could not label {vm_name} with template: {exc}[/yellow]")
+        log_message(f"Warning: could not label {vm_name} with template: {exc}", "WARNING")
 
 
 def apply_template(vm_name: str, name: str) -> bool:
@@ -89,7 +89,7 @@ def apply_template(vm_name: str, name: str) -> bool:
     a failed ``required: false`` step logs a warning, continues, and downgrades the result.
     """
     data = load_template(name)
-    console.print(f"[cyan]Applying template '{name}' to {vm_name}...[/cyan]")
+    log_message(f"Applying template '{name}' to {vm_name}...")
 
     apt_packages = data.get("apt") or []
     if apt_packages:
@@ -100,7 +100,7 @@ def apply_template(vm_name: str, name: str) -> bool:
             f"apt install ({len(apt_packages)} packages)",
             timeout=1800,
         ):
-            console.print("[red]apt install failed — aborting template apply.[/red]")
+            log_message("apt install failed — aborting template apply.", "ERROR")
             return False
 
     ok = True
@@ -113,9 +113,9 @@ def apply_template(vm_name: str, name: str) -> bool:
         timeout = int(step.get("timeout", 600))
         if not run_vm_exec(vm_name, ["bash", "-c", run], f"step: {step_name}", timeout=timeout):
             if required:
-                console.print(f"[red]Required step '{step_name}' failed — aborting.[/red]")
+                log_message(f"Required step '{step_name}' failed — aborting.", "ERROR")
                 return False
-            console.print(f"[yellow]Optional step '{step_name}' failed — continuing.[/yellow]")
+            log_message(f"Optional step '{step_name}' failed — continuing.", "WARNING")
             ok = False
 
     _set_role_label(vm_name, name)

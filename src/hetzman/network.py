@@ -6,7 +6,6 @@ import re
 import subprocess
 
 from .config import ADDITIONAL_HOSTS, get_settings
-from .console import console
 from .etcd_kv import get_all_with_prefix
 from .logging import log_message
 
@@ -73,11 +72,9 @@ def reload_dnsmasq() -> bool:
         log_message("dnsmasq reloaded successfully")
         return True
     except subprocess.CalledProcessError as e:
-        console.print(f"[red]Failed to reload dnsmasq: {e}[/red]")
         log_message(f"Failed to reload dnsmasq: {e}", "ERROR")
         return False
     except subprocess.TimeoutExpired:
-        console.print("[red]Timeout reloading dnsmasq[/red]")
         log_message("Timeout reloading dnsmasq", "ERROR")
         return False
 
@@ -94,7 +91,6 @@ def regenerate_hosts_file() -> bool:
         log_message(f"Regenerated hosts file with {len(dns_records)} records")
         return True
     except Exception as e:
-        console.print(f"[red]Error regenerating hosts file: {e}[/red]")
         log_message(f"Error regenerating hosts file: {e}", "ERROR")
         return False
 
@@ -221,10 +217,9 @@ def apply_nat_rules() -> bool:
                 f"{rule['private_ip']}:{rule['private_port']} ({rule['protocol']})"
             )
 
-        console.print(f"[green]Applied {len(nat_rules)} NAT rules and {len(port_rules)} port forwards[/green]")
+        log_message(f"Applied {len(nat_rules)} NAT rules and {len(port_rules)} port forwards")
         return True
 
     except Exception as e:
-        console.print(f"[red]Error applying NAT rules: {e}[/red]")
         log_message(f"Error applying NAT rules: {e}", "ERROR")
         return False
