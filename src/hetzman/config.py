@@ -17,7 +17,7 @@ from typing import Optional
 
 import etcd3
 
-from .console import console
+from .core.errors import EtcdUnavailable
 
 CONFIG_FILE = "/opt/hetzman-tooling/config.ini"
 ADDITIONAL_HOSTS = "/opt/hetzman-tooling/configs/additional-hosts"
@@ -111,8 +111,7 @@ def get_etcd_client():
         if attempt < passes - 1:
             time.sleep(_RETRY_SLEEP_SECONDS)
 
-    console.print("[red]ERROR: Could not connect to etcd cluster[/red]")
-    sys.exit(1)
+    raise EtcdUnavailable("Could not connect to etcd cluster")
 
 
 def reset_etcd_client() -> None:
@@ -149,7 +148,9 @@ def write_config(server: dict, all_vswitch_ips: list[str]) -> bool:
         os.replace(tmp, CONFIG_FILE)
         return True
     except OSError as e:
-        console.print(f"[red]Error writing {CONFIG_FILE}: {e}[/red]")
+        from .logging import log_message
+
+        log_message(f"Error writing {CONFIG_FILE}: {e}", "ERROR")
         try:
             os.unlink(tmp)
         except OSError:

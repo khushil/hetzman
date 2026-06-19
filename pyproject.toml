@@ -20,8 +20,11 @@ dependencies = [
     "PyYAML>=6",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-mock>=3", "textual-dev>=1.5"]
+
 [project.scripts]
-hetzman = "hetzman.cli:app"
+hetzman = "hetzman.cli:main"
 hetzman-instance-watcher = "hetzman.watcher:main"
 
 [tool.setuptools.packages.find]
@@ -29,3 +32,8 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 hetzman = ["data/*", "templates/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

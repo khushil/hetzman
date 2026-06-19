@@ -1,8 +1,8 @@
 import os
+import sys
 from datetime import datetime
 
 from .config import LOG_FILE
-from .console import console
 
 
 def log_message(message: str, level: str = "INFO") -> None:
@@ -13,4 +13,4 @@ def log_message(message: str, level: str = "INFO") -> None:
         with open(LOG_FILE, "a") as f:
             f.write(entry)
     except OSError as e:
-        console.print(f"[yellow]Warning: Could not write to log: {e}[/yellow]")
+        sys.stderr.write(f"Warning: Could not write to log: {e}\n")

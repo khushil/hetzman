@@ -13,7 +13,8 @@ import json
 import time
 from typing import Any, Dict, Optional
 
-from .config import get_etcd_client, reset_etcd_client
+from .core import concurrency
+from .core.errors import EtcdUnavailable
 from .logging import log_message
 
 _RETRIES = 3
@@ -36,16 +37,19 @@ def _recover_if_auth_error(error: Exception) -> bool:
             is_auth = False
     if is_auth:
         log_message("etcd auth token expired; re-authenticating", "WARNING")
-        reset_etcd_client()
+        concurrency.reset_client()
     return is_auth
 
 
 def get_key(key: str) -> Optional[str]:
     for i in range(_RETRIES):
         try:
-            value, _ = get_etcd_client().get(key)
-            return value.decode("utf-8") if value else None
+            with concurrency.etcd_lock():
+                value, _ = concurrency.get_client().get(key)
+                return value.decode("utf-8") if value else None
         except Exception as e:
+            if isinstance(e, EtcdUnavailable):
+                raise
             recovered = _recover_if_auth_error(e)
             if i < _RETRIES - 1:
                 if not recovered:
@@ -59,9 +63,12 @@ def get_key(key: str) -> Optional[str]:
 def put_key(key: str, value: str) -> bool:
     for i in range(_RETRIES):
         try:
-            get_etcd_client().put(key, value)
-            return True
+            with concurrency.etcd_lock():
+                concurrency.get_client().put(key, value)
+                return True
         except Exception as e:
+            if isinstance(e, EtcdUnavailable):
+                raise
             recovered = _recover_if_auth_error(e)
             if i < _RETRIES - 1:
                 if not recovered:
@@ -80,11 +87,14 @@ def put_with_lease(key: str, value: str, ttl: int) -> bool:
     """
     for i in range(_RETRIES):
         try:
-            client = get_etcd_client()
-            lease = client.lease(ttl)
-            client.put(key, value, lease=lease)
-            return True
+            with concurrency.etcd_lock():
+                client = concurrency.get_client()
+                lease = client.lease(ttl)
+                client.put(key, value, lease=lease)
+                return True
         except Exception as e:
+            if isinstance(e, EtcdUnavailable):
+                raise
             recovered = _recover_if_auth_error(e)
             if i < _RETRIES - 1:
                 if not recovered:
@@ -98,9 +108,12 @@ def put_with_lease(key: str, value: str, ttl: int) -> bool:
 def delete_key(key: str) -> bool:
     for i in range(_RETRIES):
         try:
-            get_etcd_client().delete(key)
-            return True
+            with concurrency.etcd_lock():
+                concurrency.get_client().delete(key)
+                return True
         except Exception as e:
+            if isinstance(e, EtcdUnavailable):
+                raise
             recovered = _recover_if_auth_error(e)
             if i < _RETRIES - 1:
                 if not recovered:
@@ -114,16 +127,19 @@ def delete_key(key: str) -> bool:
 def get_all_with_prefix(prefix: str) -> Dict[str, Any]:
     for i in range(_RETRIES):
         try:
-            results: Dict[str, Any] = {}
-            for value, metadata in get_etcd_client().get_prefix(prefix):
-                key = metadata.key.decode("utf-8")
-                val = value.decode("utf-8")
-                try:
-                    results[key] = json.loads(val)
-                except json.JSONDecodeError:
-                    results[key] = val
-            return results
+            with concurrency.etcd_lock():
+                results: Dict[str, Any] = {}
+                for value, metadata in concurrency.get_client().get_prefix(prefix):
+                    key = metadata.key.decode("utf-8")
+                    val = value.decode("utf-8")
+                    try:
+                        results[key] = json.loads(val)
+                    except json.JSONDecodeError:
+                        results[key] = val
+                return results
         except Exception as e:
+            if isinstance(e, EtcdUnavailable):
+                raise
             recovered = _recover_if_auth_error(e)
             if i < _RETRIES - 1:
                 if not recovered:
