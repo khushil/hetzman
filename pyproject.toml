@@ -18,6 +18,9 @@ dependencies = [
     "typer>=0.12",
     "rich>=13",
     "PyYAML>=6",
+    # Interactive TUI (`hetzman tui`). Pinned below 1.0: the Worker /
+    # call_from_thread / DataTable APIs the TUI relies on shifted across 1.x.
+    "textual>=0.80,<1.0",
 ]
 
 [project.optional-dependencies]

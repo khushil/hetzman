@@ -11,6 +11,7 @@ from .commands import ip  # noqa: F401
 from .commands import node  # noqa: F401
 from .commands import port  # noqa: F401
 from .commands import system  # noqa: F401
+from .commands import tui  # noqa: F401
 from .commands import vm  # noqa: F401
 from .commands import vm_users  # noqa: F401
 
