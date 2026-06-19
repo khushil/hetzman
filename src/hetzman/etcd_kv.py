@@ -124,6 +124,36 @@ def delete_key(key: str) -> bool:
     return False
 
 
+def replace_if_value(key: str, expected: str, new_value: str) -> bool:
+    """Atomic compare-and-swap: set *key* to *new_value* only if it currently
+    equals *expected*. Returns True iff the swap was applied (we won the race).
+
+    Used to claim a pool IP without a read-modify-write race: two concurrent
+    callers cannot both transition the same key from "available" to "assigned".
+    """
+    for i in range(_RETRIES):
+        try:
+            with concurrency.etcd_lock():
+                client = concurrency.get_client()
+                succeeded, _ = client.transaction(
+                    compare=[client.transactions.value(key) == expected],
+                    success=[client.transactions.put(key, new_value)],
+                    failure=[],
+                )
+                return bool(succeeded)
+        except Exception as e:
+            if isinstance(e, EtcdUnavailable):
+                raise
+            recovered = _recover_if_auth_error(e)
+            if i < _RETRIES - 1:
+                if not recovered:
+                    time.sleep(_BACKOFF)
+                continue
+            log_message(f"Error in compare-and-swap for {key}: {e}", "ERROR")
+            return False
+    return False
+
+
 def get_all_with_prefix(prefix: str) -> Dict[str, Any]:
     for i in range(_RETRIES):
         try:
