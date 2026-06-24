@@ -154,6 +154,7 @@ class HetzmanApp(App):
             with TabPane("IPs", id="tab-ips"):
                 yield DataTable(id="ip-table", zebra_stripes=True, cursor_type="row")
             with TabPane("DNS", id="tab-dns"):
+                yield Static("Loading resolver status…", id="dns-server-card")
                 yield DataTable(id="dns-table", zebra_stripes=True, cursor_type="row")
             with TabPane("Instances", id="tab-instances"):
                 yield DataTable(id="instance-table", zebra_stripes=True, cursor_type="row")
@@ -487,7 +488,11 @@ class HetzmanApp(App):
         except Exception as exc:  # pragma: no cover - defensive
             self.call_from_thread(self._on_load_error, "domains", exc)
             return
-        self.call_from_thread(self._render_domains, ips, dns, ports)
+        try:  # resolver status is best-effort; never blocks the domain tables
+            dns_status = reads.get_dns_server_status()
+        except Exception:  # noqa: BLE001
+            dns_status = None
+        self.call_from_thread(self._render_domains, ips, dns, ports, dns_status)
 
     @work(thread=True, group="instances", exclusive=True)
     def _load_instances(self) -> None:
@@ -580,8 +585,24 @@ class HetzmanApp(App):
             text.append(f"{status.etcd_members} members", style="green")
         self.query_one("#system-card", Static).update(text)
 
-    def _render_domains(self, ips, dns, ports) -> None:
+    def _render_domains(self, ips, dns, ports, dns_status=None) -> None:
         self.query_one(Banner).clear()
+
+        card = self.query_one("#dns-server-card", Static)
+        if dns_status is None:
+            card.update("[dim]resolver status unavailable[/dim]")
+        else:
+            s = dns_status
+
+            def tick(ok):
+                return "[green]✓[/green]" if ok else "[red]✗[/red]"
+
+            card.update(
+                f"resolver @ {s.host}   active {tick(s.active)}  forward {tick(s.forward_ok)}  "
+                f"reverse {tick(s.reverse_ok)}  dhcp {tick(s.dhcp_listener)}\n"
+                f"listen {', '.join(s.listen_addrs) or '-'}   "
+                f"fwd {', '.join(s.forwarders) or '-'}   acl {', '.join(s.external_acl) or '-'}"
+            )
 
         ip_table = self.query_one("#ip-table", DataTable)
         ip_table.clear()

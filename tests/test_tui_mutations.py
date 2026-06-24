@@ -51,6 +51,7 @@ def _reads_patch():
         patch("hetzman.core.reads.list_ips", return_value=_ips()),
         patch("hetzman.core.reads.list_dns", return_value=_dns()),
         patch("hetzman.core.reads.list_ports", return_value=_ports()),
+        patch("hetzman.core.reads.get_dns_server_status", return_value=None),
         patch("hetzman.core.reads.list_instances", return_value=([], [])),
         patch("hetzman.core.reads.list_nodes", return_value=([], [])),
     ]

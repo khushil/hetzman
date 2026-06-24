@@ -23,6 +23,7 @@ def _mock_domain_reads():
     with patch("hetzman.core.reads.list_ips", return_value=[]), \
          patch("hetzman.core.reads.list_dns", return_value=[]), \
          patch("hetzman.core.reads.list_ports", return_value=[]), \
+         patch("hetzman.core.reads.get_dns_server_status", return_value=None), \
          patch("hetzman.core.reads.list_instances", return_value=([], [])), \
          patch("hetzman.core.reads.list_nodes", return_value=([], [])):
         yield

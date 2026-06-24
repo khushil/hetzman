@@ -377,3 +377,24 @@ class UpdateStatus:
     count: int
     packages: tuple[str, ...]
     security_count: int
+
+
+@dataclass(frozen=True)
+class DnsServerStatus:
+    """Live serving state of a node's managed dnsmasq (DNS + DHCP).
+
+    Source: a single batched probe on the host (systemctl/ss/dig + a read of the
+    managed ``/etc/dnsmasq.conf``). ``external_acl`` is DERIVED from the desired
+    iptables render (the trusted :53 source CIDRs), not from the live host.
+    """
+
+    host: str
+    active: bool
+    listen_addrs: tuple[str, ...]   # e.g. ("127.0.0.1", "10.100.4.1", "10.0.0.4")
+    forwarders: tuple[str, ...]     # upstream servers, e.g. ("1.1.1.1", "8.8.8.8")
+    reverse_zones: tuple[str, ...]  # authoritative in-addr.arpa zones served
+    dhcp_range: str | None          # e.g. "10.100.4.10,10.100.4.250,..."; None if no DHCP
+    forward_ok: bool                # self-test: a known forward name resolves
+    reverse_ok: bool                # self-test: this node's vswitch IP reverse-resolves
+    dhcp_listener: bool             # a dnsmasq :67 listener is present
+    external_acl: tuple[str, ...]   # trusted :53 source CIDRs (vSwitch + opt VPN)

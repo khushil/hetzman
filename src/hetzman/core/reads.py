@@ -24,6 +24,7 @@ from . import exec as host_exec
 from .errors import CoreError, HostUnreachable
 from .models import (
     DNSRecord,
+    DnsServerStatus,
     FleetNodeStatus,
     FleetStatus,
     Instance,
@@ -383,3 +384,73 @@ def reboot_required(host: str | None = None) -> bool:
         host, ["test", "-f", "/var/run/reboot-required"], root=True, check=False, timeout=15
     )
     return res.returncode == 0
+
+
+TRUSTED_DNS_CLIENTS_KEY = "/hetzman/config/trusted-dns-clients"
+
+_DNS_PROBE = r"""
+echo "ACTIVE=$(systemctl is-active dnsmasq 2>/dev/null)"
+echo "LISTEN=$(ss -ulnH 'sport = :53' 2>/dev/null | awk '{print $4}' | sed -E 's/:53$//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u | paste -sd,)"
+echo "DHCP67=$(ss -ulnp 'sport = :67' 2>/dev/null | grep -c dnsmasq)"
+echo "FWD=$(dig +short +time=2 +tries=1 @127.0.0.1 %(fwd)s 2>/dev/null | head -1)"
+echo "REV=$(dig +short +time=2 +tries=1 -x %(vswitch)s @127.0.0.1 2>/dev/null | head -1)"
+echo "FORWARDERS=$(grep -E '^server=' /etc/dnsmasq.conf 2>/dev/null | sed 's/server=//' | paste -sd,)"
+echo "REVZONES=$(grep -E '^local=/.*in-addr\.arpa' /etc/dnsmasq.conf 2>/dev/null | sed -E 's#^local=/(.*)/#\1#' | paste -sd,)"
+echo "DHCPRANGE=$(grep -E '^dhcp-range=' /etc/dnsmasq.conf 2>/dev/null | head -1 | sed 's/dhcp-range=//')"
+"""
+
+
+def _external_acl() -> tuple[str, ...]:
+    """Trusted :53 source CIDRs (DESIRED state, from the render): the vSwitch plus
+    any valid operator VPN CIDRs in etcd. Mirrors node-sync's fail-closed read."""
+    from .. import render
+
+    acl = list(render.TRUSTED_DNS_CLIENTS)
+    try:
+        raw = get_all_with_prefix(TRUSTED_DNS_CLIENTS_KEY).get(TRUSTED_DNS_CLIENTS_KEY)
+        cidrs = raw if isinstance(raw, list) else (raw.get("cidrs") if isinstance(raw, dict) else [])
+        for cidr in cidrs or []:
+            if render.dns_acl_source_ok(str(cidr)) and cidr not in acl:
+                acl.append(str(cidr))
+    except Exception:  # noqa: BLE001 — a status read must never raise on a bad doc
+        pass
+    return tuple(acl)
+
+
+def get_dns_server_status(host: str | None = None) -> DnsServerStatus:
+    """Live serving state of one node's managed dnsmasq (DNS + DHCP).
+
+    One batched probe per node (systemctl/ss/dig + a read of dnsmasq.conf) so the
+    fleet view never fans out into ~6 sequential SSH round-trips per host.
+    """
+    from ..render import DOMAIN
+
+    registry = load_registry()
+    target = host or get_settings().current_server
+    node = registry.get(target, {})
+    vswitch = node.get("vswitch_ip", "127.0.0.1")
+    fwd_name = f"{target}.{DOMAIN}" if target else "localhost"
+    script = _DNS_PROBE % {"fwd": fwd_name, "vswitch": vswitch}
+    res = host_exec.run_on(host, ["bash", "-c", script], root=True, check=False, timeout=30)
+
+    fields: dict[str, str] = {}
+    for line in res.stdout.splitlines():
+        if "=" in line:
+            key, _, val = line.partition("=")
+            fields[key] = val.strip()
+
+    def _csv(key: str) -> tuple[str, ...]:
+        return tuple(p for p in fields.get(key, "").split(",") if p)
+
+    return DnsServerStatus(
+        host=target or "?",
+        active=fields.get("ACTIVE") == "active",
+        listen_addrs=_csv("LISTEN"),
+        forwarders=_csv("FORWARDERS"),
+        reverse_zones=_csv("REVZONES"),
+        dhcp_range=fields.get("DHCPRANGE") or None,
+        forward_ok=bool(fields.get("FWD")),
+        reverse_ok=bool(target and target in fields.get("REV", "")),
+        dhcp_listener=fields.get("DHCP67", "0") not in ("0", ""),
+        external_acl=_external_acl(),
+    )

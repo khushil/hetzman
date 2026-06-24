@@ -4,6 +4,7 @@ Typer apps defined in :mod:`hetzman.apps`.
 from .apps import app
 
 # Import command modules so their @app.command decorators register.
+from .commands import config  # noqa: F401
 from .commands import dns  # noqa: F401
 from .commands import etcd_admin  # noqa: F401
 from .commands import fleet  # noqa: F401
