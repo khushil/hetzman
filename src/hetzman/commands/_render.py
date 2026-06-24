@@ -18,6 +18,7 @@ from ..console import console
 from ..core.errors import (
     CoreError,
     EtcdUnavailable,
+    HostUnreachable,
     NotFoundError,
     PrivilegeError,
     ValidationError,
@@ -68,6 +69,9 @@ def drive(gen, *, exit_on_failure: bool = False) -> Optional[OpResult]:
             console.print(_format(event))
     except PrivilegeError as exc:
         console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    except HostUnreachable as exc:
+        console.print(f"[red]Host unreachable: {exc}[/red]")
         raise typer.Exit(1)
     except (ValidationError, NotFoundError, EtcdUnavailable, CoreError) as exc:
         console.print(f"[red]Error: {exc}[/red]")

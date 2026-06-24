@@ -27,13 +27,20 @@ import unittest
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 _MODULES_UNDER_TEST: list[str] = [
-    # core sub-modules
+    # core sub-modules (EVERY file under src/hetzman/core/ — enforced below)
     "hetzman.core.events",
     "hetzman.core.errors",
     "hetzman.core.privilege",
     "hetzman.core.models",
     "hetzman.core.concurrency",
     "hetzman.core.reads",
+    "hetzman.core.dns",
+    "hetzman.core.ip",
+    "hetzman.core.ports",
+    "hetzman.core.templates",
+    "hetzman.core.users",
+    "hetzman.core.vms",
+    "hetzman.core.exec",
     # decoupled low-level modules
     "hetzman.config",
     "hetzman.logging",
@@ -45,6 +52,16 @@ _MODULES_UNDER_TEST: list[str] = [
     "hetzman.templates",
     "hetzman.vm_helpers",
 ]
+
+
+def _all_core_modules() -> set[str]:
+    """Every importable module under src/hetzman/core/ (excluding __init__)."""
+    core_dir = os.path.join(_REPO_ROOT, "src", "hetzman", "core")
+    mods = set()
+    for name in os.listdir(core_dir):
+        if name.endswith(".py") and name != "__init__.py":
+            mods.add(f"hetzman.core.{name[:-3]}")
+    return mods
 
 _PROBE = (
     "import {mod}; import sys; "
@@ -82,6 +99,16 @@ def _make_test(module_name: str):
 
 class TestCoreImportIsolation(unittest.TestCase):
     """Verify that no core / low-level module drags in hetzman.console."""
+
+    def test_every_core_module_is_covered(self) -> None:
+        """A new file under core/ must be added to the tripwire — fail until it is,
+        so a console-importing core module can never slip in unguarded."""
+        listed = {m for m in _MODULES_UNDER_TEST if m.startswith("hetzman.core.")}
+        missing = _all_core_modules() - listed
+        self.assertEqual(
+            missing, set(),
+            msg=f"core modules not covered by the console tripwire: {sorted(missing)}",
+        )
 
 
 # Dynamically attach one test method per module so failures are reported

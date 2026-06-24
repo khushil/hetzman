@@ -26,3 +26,8 @@ class PrivilegeError(CoreError):
 
 class EtcdUnavailable(CoreError):
     """The etcd cluster was unreachable after retries."""
+
+
+class HostUnreachable(CoreError):
+    """A fleet host could not be reached over SSH (distinct from a command that
+    ran and failed). Lets front-ends say "host down" rather than "op failed"."""
