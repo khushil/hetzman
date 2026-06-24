@@ -6,7 +6,9 @@ returns bool and logs its own step detail). Confirmation for the destructive
 """
 from __future__ import annotations
 
+import os
 import subprocess
+import tempfile
 
 from ..logging import log_message
 from ..vm_helpers import check_vm_exists, check_vm_user_exists, run_vm_exec
@@ -53,12 +55,21 @@ def add_user(
     if not run_vm_exec(vm_name, ["mkdir", "-p", ssh_dir], "Creating .ssh directory"):
         raise CoreError("Failed to create .ssh directory")
 
+    pubkey = _read_pubkey(key_file)  # accepts inline content or a path
+    fd, tmp_key = tempfile.mkstemp(suffix=".pub")
     try:
-        _push_key(vm_name, key_file, auth_keys)
+        with os.fdopen(fd, "w") as tf:
+            tf.write(pubkey)
+        _push_key(vm_name, tmp_key, auth_keys)
     except CoreError:
         # Compensation: roll back the half-created user.
         run_vm_exec(vm_name, ["userdel", "-r", username], f"Cleaning up failed user {username}")
         raise
+    finally:
+        try:
+            os.unlink(tmp_key)
+        except OSError:
+            pass
 
     if not run_vm_exec(vm_name, ["chown", "-R", f"{username}:{username}", ssh_dir], "Setting .ssh owner"):
         yield ProgressEvent(Severity.WARNING, f"Could not set owner on {ssh_dir}")
@@ -123,12 +134,20 @@ def change_keys(vm_name: str, username: str, key_file: str) -> ProgressGen:
 # --------------------------------------------------------------------------- #
 # Host users — useradd on the bare-metal node itself, via the executor
 # --------------------------------------------------------------------------- #
-def _read_pubkey(key_file: str) -> str:
+def _read_pubkey(key: str) -> str:
+    """Resolve a public key from either inline content or a file path.
+
+    The TUI (and cross-host delegation) pass the key text directly; the CLI
+    passes a path. An ``ssh-…``/``ecdsa-…``/``sk-…`` string with a space is
+    treated as content, anything else as a file to read."""
+    stripped = key.strip()
+    if stripped.startswith(("ssh-", "ecdsa-", "sk-", "ssh-ed25519")) and " " in stripped:
+        return stripped + "\n"
     try:
-        with open(key_file) as f:
+        with open(key) as f:
             return f.read()
     except OSError as exc:
-        raise ValidationError(f"cannot read key file {key_file}: {exc}")
+        raise ValidationError(f"cannot read key file {key}: {exc}")
 
 
 def _host_step(host: str, argv: list[str], label: str) -> bool:

@@ -18,7 +18,7 @@ from __future__ import annotations
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
-from textual.command import Hit, Hits, Provider
+from textual.command import DiscoveryHit, Hit, Hits, Provider
 from textual.widgets import (
     DataTable,
     Footer,
@@ -36,11 +36,13 @@ from ..core import nodes as core_nodes
 from ..core import ops as core_ops
 from ..core import ports as core_ports
 from ..core import reads
+from ..core import users as core_users
 from ..core import vms as core_vms
 from ..core.errors import CoreError, EtcdUnavailable
 from ..core.events import ProgressEvent, Severity
 from ..core.models import FleetStatus, SystemStatus
 from .modals import (
+    AddUserModal,
     ConfirmModal,
     DnsAddModal,
     HostPickerModal,
@@ -86,6 +88,7 @@ class HetzmanCommands(Provider):
             ("Add port forward", lambda: app.push_add("tab-ports")),
             ("Change instance (cpu/mem/disk)", app.action_change_instance),
             ("Reboot instance", app.action_reboot_instance),
+            ("Add user (selected VM or host)", app.action_add_user),
             ("Apply updates on a host", app.action_apply_updates),
             ("Reboot a host", app.action_reboot_host),
             ("Remove node from fleet", app.action_remove_node),
@@ -99,6 +102,12 @@ class HetzmanCommands(Provider):
             ("Go to: DNS", lambda: app.goto("tab-dns")),
             ("Go to: Ports", lambda: app.goto("tab-ports")),
         ]
+
+    async def discover(self) -> Hits:
+        """Show EVERY action the moment the palette opens (empty query), so the
+        user browses the full menu instead of guessing command names."""
+        for name, callback in self._commands:
+            yield DiscoveryHit(name, callback, help=name)
 
     async def search(self, query: str) -> Hits:
         matcher = self.matcher(query)
@@ -132,8 +141,9 @@ class HetzmanApp(App):
         ("a", "add", "Add"),
         ("c", "change_instance", "Change"),
         ("b", "reboot_instance", "Reboot"),
+        ("u", "add_user", "Add user"),
         ("d", "delete", "Delete"),
-        ("ctrl+p", "command_palette", "More…"),
+        ("ctrl+p", "command_palette", "All actions"),
         ("q", "quit", "Quit"),
     ]
 
@@ -280,6 +290,44 @@ class HetzmanApp(App):
             TypedConfirmModal(f"Remove node {name} + its etcd member (guarded)", name),
             _confirmed,
         )
+
+    def action_add_user(self) -> None:
+        """Add a user to the selected VM (Instances tab) or host (Nodes tab)."""
+        tab = self._active_tab
+        if tab == "tab-instances":
+            row = self._selected("#instance-table")
+            if not row:
+                self.query_one(LogPanel).info("Select an instance row first (Instances tab).")
+                return
+            self.push_screen(AddUserModal("vm", row[0], row[1]), self._on_add_user)
+        elif tab == "tab-nodes":
+            row = self._selected("#node-table")
+            if not row:
+                self.query_one(LogPanel).info("Select a node row first (Nodes tab).")
+                return
+            self.push_screen(AddUserModal("host", row[0], row[0]), self._on_add_user)
+        else:
+            self.query_one(LogPanel).info(
+                "Add user: select an instance (Instances tab) or a host (Nodes tab) first.")
+
+    def _on_add_user(self, data) -> None:
+        if not data:
+            return
+        target, host = data["target"], data["host"]
+        user, key, sudo = data["username"], data["key"], data["sudo"]
+        if data["scope"] == "host":
+            # add_host_user runs against `host` via the executor (local or SSH).
+            self._run_mutation(
+                lambda: core_users.add_host_user(host, user, key, sudo=sudo),
+                f"add user {user}@host {host}")
+        else:  # vm — local core call, or delegate the CLI (with the key inline)
+            remote = ["vm", "users", "add", target, user, "--key-content", key]
+            if sudo:
+                remote.append("--sudo")
+            self._delegate(
+                host, remote,
+                lambda: core_users.add_user(target, user, key, sudo=sudo),
+                f"add user {user}@{target}")
 
     def _pick_then(self, callback) -> None:
         """Open the host picker, then call back with the chosen host."""

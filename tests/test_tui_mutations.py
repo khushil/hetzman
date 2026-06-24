@@ -197,6 +197,60 @@ def test_nodes_tab_populates_and_remove_uses_typed_confirm():
     _run(body)
 
 
+def test_command_palette_discover_lists_every_action():
+    """The palette must show ALL actions on open (discover), not make the user
+    guess command names."""
+    async def body():
+        patches = _reads_patch()
+        for p in patches:
+            p.start()
+        try:
+            from hetzman.tui.app import HetzmanCommands
+            app = HetzmanApp()
+            async with app.run_test():
+                provider = HetzmanCommands(app.screen)
+                hits = [h async for h in provider.discover()]
+                assert len(hits) == len(provider._commands)
+                names = [str(h.display) for h in hits]
+                assert any("Add user" in n for n in names)
+                assert any("Create VM" in n for n in names)
+        finally:
+            for p in patches:
+                p.stop()
+    _run(body)
+
+
+def test_add_user_host_scope_runs_add_host_user():
+    async def body():
+        patches = _reads_patch()
+        for p in patches:
+            p.start()
+        seen = {}
+
+        def fake_add_host(host, user, key, *, sudo=False):
+            seen.update(host=host, user=user, key=key, sudo=sudo)
+            yield ProgressEvent(Severity.SUCCESS, "ok")
+            return OpResult(ok=True, summary={})
+
+        try:
+            with patch("hetzman.tui.app.core_users.add_host_user", side_effect=fake_add_host):
+                app = HetzmanApp()
+                async with app.run_test() as pilot:
+                    await app.workers.wait_for_complete()
+                    app._on_add_user({
+                        "scope": "host", "target": "htz-a", "host": "htz-a",
+                        "username": "alice", "key": "ssh-ed25519 AAAA alice@h", "sudo": True,
+                    })
+                    await app.workers.wait_for_complete()
+                    await pilot.pause()
+            assert seen == {"host": "htz-a", "user": "alice",
+                            "key": "ssh-ed25519 AAAA alice@h", "sudo": True}
+        finally:
+            for p in patches:
+                p.stop()
+    _run(body)
+
+
 def test_command_palette_provider_lists_actions():
     async def body():
         patches = _reads_patch()

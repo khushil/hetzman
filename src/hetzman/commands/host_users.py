@@ -1,5 +1,6 @@
 """`hetzman host users` — manage users on the bare-metal fleet hosts."""
 from pathlib import Path
+from typing import Optional
 
 import typer
 
@@ -13,14 +14,21 @@ from ._render import drive
 def host_users_add(
     host: str = typer.Argument(..., help="Fleet host name"),
     username: str = typer.Argument(..., help="Username to create"),
-    key_file: Path = typer.Option(
-        ..., "--key", help="Path to the user's public SSH key (on this box)",
+    key_file: Optional[Path] = typer.Option(
+        None, "--key", help="Path to the user's public SSH key (on this box)",
         exists=True, file_okay=True, dir_okay=False, readable=True,
+    ),
+    key_content: Optional[str] = typer.Option(
+        None, "--key-content", help="The public SSH key inline (alternative to --key)",
     ),
     sudo: bool = typer.Option(False, "--sudo", help="Grant passwordless sudo"),
 ):
     """Add a user to a fleet host with an SSH key and optional sudo."""
-    drive(core_users.add_host_user(host, username, str(key_file), sudo=sudo))
+    key = key_content if key_content else (str(key_file) if key_file else None)
+    if not key:
+        console.print("[red]Provide --key <file> or --key-content <key>[/red]")
+        raise typer.Exit(code=2)
+    drive(core_users.add_host_user(host, username, key, sudo=sudo))
 
 
 @host_users_app.command("remove")

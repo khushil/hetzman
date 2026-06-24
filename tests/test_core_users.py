@@ -23,7 +23,7 @@ class AddUserTests(unittest.TestCase):
     @mock.patch("hetzman.core.users.check_vm_exists", return_value=True)
     @mock.patch("hetzman.core.users.require_root")
     def test_add_success(self, root, exists, uexists, run, push):
-        events, result = _drain(core_users.add_user("vm", "alice", "/k.pub"))
+        events, result = _drain(core_users.add_user("vm", "alice", "ssh-ed25519 AAAAk alice@h"))
         self.assertTrue(result.ok)
         self.assertTrue(any(e.severity == Severity.SUCCESS for e in events))
         push.assert_called_once()
@@ -35,7 +35,7 @@ class AddUserTests(unittest.TestCase):
     @mock.patch("hetzman.core.users.require_root")
     def test_add_key_push_failure_rolls_back_user(self, root, exists, uexists, run, push):
         with self.assertRaises(CoreError):
-            _drain(core_users.add_user("vm", "alice", "/k.pub"))
+            _drain(core_users.add_user("vm", "alice", "ssh-ed25519 AAAAk alice@h"))
         # userdel cleanup must have run
         self.assertTrue(
             any(c.args[1][0] == "userdel" for c in run.call_args_list),
@@ -47,7 +47,7 @@ class AddUserTests(unittest.TestCase):
     @mock.patch("hetzman.core.users.require_root")
     def test_add_existing_user_raises(self, root, exists, uexists):
         with self.assertRaises(ValidationError):
-            _drain(core_users.add_user("vm", "alice", "/k.pub"))
+            _drain(core_users.add_user("vm", "alice", "ssh-ed25519 AAAAk alice@h"))
 
 
 class RemoveUserTests(unittest.TestCase):

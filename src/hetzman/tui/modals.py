@@ -286,6 +286,36 @@ class TypedConfirmModal(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class AddUserModal(_FormModal):
+    """Add a user (with SSH key + optional sudo) to a host or a VM/container."""
+
+    def __init__(self, scope: str, target: str, host: str):
+        super().__init__()
+        self._scope = scope        # "host" | "vm"
+        self._target = target
+        self._host = host
+        where = f"host {target}" if scope == "host" else f"{scope} {target} (on {host})"
+        self.title_text = f"Add user to {where}"
+
+    def compose_fields(self) -> ComposeResult:
+        yield Label("Username", classes="field")
+        yield Input(id="username", placeholder="alice")
+        yield Label("SSH public key", classes="field")
+        yield Input(id="key", placeholder="ssh-ed25519 AAAA... user@host")
+        yield Checkbox("Grant passwordless sudo", id="sudo")
+
+    def collect(self) -> Optional[dict]:
+        user = self._val("username")
+        key = self._val("key")
+        if not user or not key:
+            return None
+        return {
+            "scope": self._scope, "target": self._target, "host": self._host,
+            "username": user, "key": key,
+            "sudo": self.query_one("#sudo", Checkbox).value,
+        }
+
+
 class VmCreateModal(_FormModal):
     title_text = "Create VM / container"
 

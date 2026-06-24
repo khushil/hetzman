@@ -23,14 +23,21 @@ def _require_root():
 def vm_users_add(
     vm_name: str = typer.Argument(..., help="Name of the VM"),
     username: str = typer.Argument(..., help="Username to create"),
-    key_file: Path = typer.Option(
-        ..., "--key", help="Path to the user's public SSH key file on the host",
+    key_file: Optional[Path] = typer.Option(
+        None, "--key", help="Path to the user's public SSH key file on the host",
         exists=True, file_okay=True, dir_okay=False, readable=True,
+    ),
+    key_content: Optional[str] = typer.Option(
+        None, "--key-content", help="The public SSH key inline (alternative to --key)",
     ),
     sudo: bool = typer.Option(False, "--sudo", help="Grant passwordless sudo privileges"),
 ):
     """Add a new user to a VM with SSH key and optional sudo."""
-    drive(core_users.add_user(vm_name, username, str(key_file), sudo=sudo))
+    key = key_content if key_content else (str(key_file) if key_file else None)
+    if not key:
+        console.print("[red]Provide --key <file> or --key-content <key>[/red]")
+        raise typer.Exit(code=2)
+    drive(core_users.add_user(vm_name, username, key, sudo=sudo))
 
 
 @users_app.command("remove")
