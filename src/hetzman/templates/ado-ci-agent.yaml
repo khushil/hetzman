@@ -31,6 +31,13 @@ apt:
   - btop
   - iftop
 
+  # --- BEAM toolchain build-deps (CONSTANCE S-F1.2): kerl compiles OTP 29 from
+  # source; essentials only — wx/odbc/observer are disabled in the asdf step.
+  - autoconf
+  - m4
+  - libncurses-dev
+  - libssl-dev
+
 scripts:
   - name: git-lfs-system-install
     required: false
@@ -151,3 +158,45 @@ scripts:
       fi
       chown -R ubuntu:ubuntu "$TC"
       chmod 0775 "$TC"
+
+  - name: asdf-beam-toolchain
+    required: false
+    timeout: 2400
+    run: |
+      set -e
+      # CONSTANCE BEAM toolchain (Story S-F1.2): asdf (Go, >=0.16) + erlang
+      # 29.0.2 + elixir 1.20.1-otp-29 for the agent user `ubuntu`, matching
+      # constance/.tool-versions. asdf >=0.16 is a standalone Go binary (no
+      # asdf.sh): it is installed to $ASDF_DATA_DIR/bin so the shims:bin PATH
+      # activation finds it. Idempotent (asdf install skips present versions;
+      # the binary download is skipped when the pinned version is already
+      # present). erlang compiles via kerl with wx/odbc/observer/debugger
+      # disabled (fewer deps, faster). Additive: never touches the resident
+      # MLE/Python toolset; best-effort (required:false) so a BEAM hiccup never
+      # breaks MLE agent provisioning.
+      su - ubuntu -c '
+        set -e
+        export ASDF_DATA_DIR="$HOME/.asdf"
+        export PATH="$ASDF_DATA_DIR/shims:$ASDF_DATA_DIR/bin:$PATH"
+        ASDF_VERSION=v0.19.0
+        if ! command -v asdf >/dev/null 2>&1 || ! asdf --version 2>/dev/null | grep -q "$ASDF_VERSION"; then
+          mkdir -p "$ASDF_DATA_DIR/bin"
+          curl -fsSL -o /tmp/asdf.tgz "https://github.com/asdf-vm/asdf/releases/download/$ASDF_VERSION/asdf-$ASDF_VERSION-linux-amd64.tar.gz"
+          tar -xzf /tmp/asdf.tgz -C /tmp asdf
+          mv -f /tmp/asdf "$ASDF_DATA_DIR/bin/asdf"
+          chmod +x "$ASDF_DATA_DIR/bin/asdf"
+          rm -f /tmp/asdf.tgz "$ASDF_DATA_DIR/asdf.sh" "$ASDF_DATA_DIR/asdf.fish" "$ASDF_DATA_DIR/asdf.nu"
+        fi
+        asdf plugin list 2>/dev/null | grep -qx erlang || asdf plugin add erlang https://github.com/asdf-vm/asdf-erlang.git
+        asdf plugin list 2>/dev/null | grep -qx elixir || asdf plugin add elixir https://github.com/asdf-vm/asdf-elixir.git
+        export KERL_CONFIGURE_OPTIONS="--without-wx --without-odbc --without-observer --without-debugger --without-et --without-megaco"
+        export MAKEFLAGS="-j$(nproc)"
+        asdf install erlang 29.0.2
+        asdf install elixir 1.20.1-otp-29
+        asdf set -u erlang 29.0.2
+        asdf set -u elixir 1.20.1-otp-29
+        asdf reshim
+        mix local.hex --force
+        mix local.rebar --force
+        elixir --version
+      '

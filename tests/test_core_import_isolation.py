@@ -12,10 +12,12 @@ drag in the Rich console at import time — that belongs exclusively in the
 presentation layer (P3 and above).
 
 This guard fires the instant a future agent imports an un-decoupled utility
-(network.py, vm_helpers.py, render.py, …) into core or into a low-level
-module, because those utilities currently import hetzman.console at module
-level.  Catching it here — before the change is merged — is exactly the right
-moment.
+(network.py, vm_helpers.py, …) into core or into a low-level module, because
+those utilities currently import hetzman.console at module level.  Catching it
+here — before the change is merged — is exactly the right moment.
+
+(render.py is NOT in that set — it imports only re/ipaddress/typing/yaml and is
+safe to use from core; it is kept out of core on layering grounds, not console.)
 """
 from __future__ import annotations
 

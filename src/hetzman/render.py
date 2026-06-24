@@ -17,8 +17,9 @@ against disk and applies. Two hard safety properties live here:
 """
 from __future__ import annotations
 
+import ipaddress
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import yaml
 
@@ -29,6 +30,44 @@ INCUS_BRIDGE = "incusbr0"
 ROUTE_METRIC = 100
 
 MANAGED_HEADER = "# Managed by hetzman node-sync - do not edit by hand\n"
+
+# --- managed dnsmasq.conf knobs (pinned to the live, captured config) --------
+# DNS_ADDN_HOSTS must equal config.ADDITIONAL_HOSTS (asserted in test_render);
+# kept as a literal here so render.py stays free of the etcd-importing config.
+DNS_ADDN_HOSTS = "/opt/hetzman-tooling/configs/additional-hosts"
+DNS_LEASEFILE = "/var/lib/misc/dnsmasq.leases"
+DNS_LOG_FACILITY = "/var/log/hetzman-tooling/dnsmasq.log"
+DNS_FORWARDERS: Tuple[str, ...] = ("1.1.1.1", "8.8.8.8")
+DNS_FORWARD_MAX = 150
+DNS_CACHE_SIZE = 1000
+# Authoritative reverse zones (answered locally, NEVER forwarded upstream).
+# Safe to make the whole 10.100.0.0/16 authoritative on every node because the
+# hetzman addn-hosts file carries EVERY fleet instance on EVERY node (global),
+# so cross-node instance PTRs resolve; unknown private reverse -> local NXDOMAIN.
+#   0.0.10.in-addr.arpa   == 10.0.0.0/24   (vSwitch)
+#   100.10.in-addr.arpa   == 10.100.0.0/16 (all per-node bridges)
+DNS_REVERSE_ZONES: Tuple[str, ...] = ("0.0.10.in-addr.arpa", "100.10.in-addr.arpa")
+
+# Trusted source ranges allowed to reach :53 (default: the vSwitch only). An
+# operator may add a VPN CIDR via /hetzman/config/trusted-dns-clients; node-sync
+# validates + passes it in. NEVER public — enforced by _assert_dns_acl_safe.
+TRUSTED_DNS_CLIENTS: Tuple[str, ...] = (VSWITCH_SUBNET,)
+_RFC1918 = tuple(
+    ipaddress.ip_network(c) for c in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+)
+
+
+def dns_acl_source_ok(cidr: str) -> bool:
+    """True iff ``cidr`` is a private (RFC1918) subnet narrow enough to be a
+    safe :53 ACL source: rejects public ranges, ``0.0.0.0/0`` and anything
+    broader than /16 (e.g. a 10.0.0.0/8 blanket)."""
+    try:
+        net = ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        return False
+    if net.version != 4 or net.prefixlen < 16:
+        return False
+    return any(net.subnet_of(s) for s in _RFC1918)
 
 
 class RenderError(Exception):
@@ -46,7 +85,12 @@ def render_dnsmasq_include(nodes: Dict[str, dict]) -> str:
 
 
 def dnsmasq_conf_lines_to_remove(conf_text: str, nodes: Dict[str, dict]) -> List[str]:
-    """host-record lines in dnsmasq.conf superseded by the managed include."""
+    """host-record lines in dnsmasq.conf superseded by the managed include.
+
+    Superseded once the conf is fully hetzman-managed: ``render_dnsmasq_conf``
+    never emits node host-record lines (they live only in the include), so
+    node-sync short-circuits this legacy migration for a managed conf.
+    """
     hostnames = {f"{name}.{DOMAIN}" for name in nodes}
     doomed = []
     for line in conf_text.splitlines():
@@ -56,6 +100,81 @@ def dnsmasq_conf_lines_to_remove(conf_text: str, nodes: Dict[str, dict]) -> List
             if record in hostnames:
                 doomed.append(line)
     return doomed
+
+
+def render_dnsmasq_conf(self_node: dict, *, vlan_listen: bool) -> str:
+    """The full managed ``/etc/dnsmasq.conf`` for one node (DNS **and** DHCP).
+
+    Reproduces the captured hand-rolled config exactly, plus three deliberate
+    hardenings: (1) explicit interface scoping that never binds the public
+    interface (``except-interface`` + named ifaces only); (2) DHCP confined to
+    the bridge (``no-dhcp-interface`` on lo and the vSwitch) so it can't hand
+    bridge-pool leases to vSwitch hosts; (3) authoritative reverse zones. When
+    ``vlan_listen`` is True the vSwitch iface is added for trusted external
+    clients — node-sync passes True only after a live address-up probe so the
+    candidate can always bind (a down vSwitch iface would otherwise fail the
+    restart that ``dnsmasq --test`` cannot catch).
+    """
+    bridge_ip = self_node["bridge_ip"]
+    vlan_iface = self_node["vlan_interface"]
+    primary_iface = self_node["primary_interface"]
+    net = ipaddress.ip_network(self_node["bridge_subnet"])
+    dhcp_start = net.network_address + 10
+    dhcp_end = net.network_address + 250
+    netmask = net.netmask
+
+    lines: List[str] = [MANAGED_HEADER.rstrip("\n")]
+    # --- listening: explicit ifaces; DHCP on the bridge only, never public ---
+    lines += ["interface=lo", f"interface={INCUS_BRIDGE}"]
+    if vlan_listen:
+        lines.append(f"interface={vlan_iface}")
+    lines += [f"except-interface={primary_iface}", "bind-dynamic", "no-dhcp-interface=lo"]
+    if vlan_listen:
+        lines.append(f"no-dhcp-interface={vlan_iface}")
+    # --- forward zone + recursion (trusted clients only; see iptables ACL) ---
+    lines += [
+        f"domain={DOMAIN}",
+        f"local=/{DOMAIN}/",
+        "expand-hosts",
+        "domain-needed",
+        "bogus-priv",
+        "no-negcache",
+        "stop-dns-rebind",
+        "rebind-localhost-ok",
+        f"dns-forward-max={DNS_FORWARD_MAX}",
+        "no-resolv",
+    ]
+    lines += [f"server={fwd}" for fwd in DNS_FORWARDERS]
+    lines.append(f"cache-size={DNS_CACHE_SIZE}")
+    # --- authoritative reverse zones (never forwarded upstream) ---
+    lines += [f"local=/{zone}/" for zone in DNS_REVERSE_ZONES]
+    # --- DHCP (bridge only) ---
+    lines += [
+        f"dhcp-range={dhcp_start},{dhcp_end},{netmask},12h",
+        f"dhcp-option=option:router,{bridge_ip}",
+        f"dhcp-option=option:dns-server,{bridge_ip}",
+        f"dhcp-option=option:domain-name,{DOMAIN}",
+        "dhcp-authoritative",
+        "dhcp-rapid-commit",
+        f"dhcp-leasefile={DNS_LEASEFILE}",
+    ]
+    # --- records + logging ---
+    lines += [
+        f"addn-hosts={DNS_ADDN_HOSTS}",
+        f"log-facility={DNS_LOG_FACILITY}",
+        "log-queries=extra",
+        "log-dhcp",
+    ]
+    text = "\n".join(lines) + "\n"
+
+    # Safety: the public interface must be excepted and never bound (a public
+    # listener + recursion = an open resolver). dnsmasq --test cannot catch this.
+    if f"\nexcept-interface={primary_iface}\n" not in text:
+        raise RenderError("unsafe dnsmasq.conf: public interface not excepted")
+    # line-anchored so 'except-interface=eth0' doesn't read as 'interface=eth0'
+    if f"\ninterface={primary_iface}\n" in text:
+        raise RenderError(f"unsafe dnsmasq.conf: binds public interface {primary_iface}")
+    return text
 
 
 # --------------------------------------------------------------------------
@@ -124,9 +243,39 @@ def _etcd_accepts(nodes: Dict[str, dict]) -> List[str]:
     ]
 
 
-def render_iptables_base(self_node: dict, nodes: Dict[str, dict]) -> str:
+def _dns_accepts(trusted: Sequence[str]) -> List[str]:
+    """udp+tcp :53 ACCEPTs, one source per trusted CIDR (validated by caller)."""
+    rules: List[str] = []
+    for cidr in trusted:
+        rules.append(f"-A INPUT -s {cidr} -p udp -m udp --dport 53 -j ACCEPT")
+        rules.append(f"-A INPUT -s {cidr} -p tcp -m tcp --dport 53 -j ACCEPT")
+    return rules
+
+
+def _assert_dns_acl_safe(text_lines: Sequence[str]) -> None:
+    """Refuse to ship any :53 ACCEPT that isn't scoped to a safe private source.
+
+    The inverse of the must-contain-SSH lifeline: ``iptables-restore --test``
+    proves syntax, never that we didn't just open a public resolver. Scans the
+    actual rendered/applied rules, so an ``-i``-only or public ``-s`` is caught.
+    """
+    for line in text_lines:
+        if "--dport 53" not in line:
+            continue
+        match = re.search(r"-s (\S+)", line)
+        if not match or not dns_acl_source_ok(match.group(1)):
+            raise RenderError(f"unsafe :53 accept (unscoped/public source): {line!r}")
+
+
+def render_iptables_base(
+    self_node: dict,
+    nodes: Dict[str, dict],
+    trusted_dns_clients: Optional[Sequence[str]] = None,
+) -> str:
     subnet = self_node["bridge_subnet"]
     accepts = _etcd_accepts(nodes)
+    trusted = list(TRUSTED_DNS_CLIENTS if trusted_dns_clients is None else trusted_dns_clients)
+    dns_accepts = _dns_accepts(trusted)
     text = "\n".join(
         [
             "# Managed by hetzman node-sync (canonical base; per-instance NAT is",
@@ -148,6 +297,7 @@ def render_iptables_base(self_node: dict, nodes: Dict[str, dict]) -> str:
             "-A INPUT -i lo -j ACCEPT",
             "-A INPUT -p tcp -m tcp --dport 22 -j ACCEPT",
             f"-A INPUT -s {VSWITCH_SUBNET} -p tcp -m tcp --dport 8443 -j ACCEPT",
+            *dns_accepts,
             *accepts,
             "-A INPUT -p icmp -m icmp --icmp-type 8 -j ACCEPT",
             "-A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT",
@@ -181,6 +331,7 @@ def render_iptables_base(self_node: dict, nodes: Dict[str, dict]) -> str:
             raise RenderError(f"unsafe iptables base: missing {snippet!r}")
     if not nodes:
         raise RenderError("unsafe iptables base: empty registry")
+    _assert_dns_acl_safe(text.splitlines())
     return text
 
 
@@ -206,9 +357,14 @@ def base_policies() -> List[Tuple[str, str, str]]:
     ]
 
 
-def base_ensure_rules(self_node: dict, nodes: Dict[str, dict]) -> List[Tuple[str, str, List[str]]]:
+def base_ensure_rules(
+    self_node: dict,
+    nodes: Dict[str, dict],
+    trusted_dns_clients: Optional[Sequence[str]] = None,
+) -> List[Tuple[str, str, List[str]]]:
     """(table, chain, args) tuples to ensure live, via ``iptables -C || -A``."""
     subnet = self_node["bridge_subnet"]
+    trusted = list(TRUSTED_DNS_CLIENTS if trusted_dns_clients is None else trusted_dns_clients)
     rules: List[Tuple[str, str, List[str]]] = [
         ("mangle", "FORWARD", ["-p", "tcp", "-m", "tcp", "--tcp-flags", "SYN,RST", "SYN",
                                "-j", "TCPMSS", "--clamp-mss-to-pmtu"]),
@@ -219,6 +375,14 @@ def base_ensure_rules(self_node: dict, nodes: Dict[str, dict]) -> List[Tuple[str
         ("filter", "INPUT", ["-s", VSWITCH_SUBNET, "-p", "tcp", "-m", "tcp",
                              "--dport", "8443", "-j", "ACCEPT"]),
     ]
+    for cidr in trusted:
+        rules.append(("filter", "INPUT", ["-s", cidr, "-p", "udp", "-m", "udp",
+                                          "--dport", "53", "-j", "ACCEPT"]))
+        rules.append(("filter", "INPUT", ["-s", cidr, "-p", "tcp", "-m", "tcp",
+                                          "--dport", "53", "-j", "ACCEPT"]))
+    # Same fail-closed guard as the rendered base: the live -A path is otherwise
+    # ungated, so a bad trusted CIDR could open :53 to the world.
+    _assert_dns_acl_safe([" ".join(args) for _, _, args in rules])
     for name in sorted(nodes):
         rules.append(("filter", "INPUT", ["-s", f"{nodes[name]['vswitch_ip']}/32", "-p", "tcp",
                                           "-m", "tcp", "--dport", "2379:2380", "-j", "ACCEPT"]))

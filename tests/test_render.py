@@ -5,11 +5,15 @@ import pytest
 import yaml
 
 from hetzman.render import (
+    DNS_ADDN_HOSTS,
+    DNS_REVERSE_ZONES,
     RenderError,
     base_ensure_rules,
+    dns_acl_source_ok,
     dnsmasq_conf_lines_to_remove,
     iptables_cleanup_plan,
     netplan_semantically_equal,
+    render_dnsmasq_conf,
     render_dnsmasq_include,
     render_iptables_base,
     render_netplan_vswitch,
@@ -61,6 +65,138 @@ def test_dnsmasq_migration_only_removes_registry_hosts():
     doomed = dnsmasq_conf_lines_to_remove(conf, FLEET)
     assert len(doomed) == 1
     assert "dc7" in doomed[0]
+
+
+# The live, hand-rolled dnsmasq.conf captured from dc12 in Phase 0 (the golden
+# source of truth). render_dnsmasq_conf must reproduce EVERY directive here or a
+# VM loses its lease/router/DNS. dc12 == FLEET["htz-hel1-dc12-bm-01"] (n=4).
+CAPTURED_DC12 = """\
+interface=lo
+interface=incusbr0
+bind-dynamic
+domain=daemondreams.home.arpa
+local=/daemondreams.home.arpa/
+expand-hosts
+domain-needed
+bogus-priv
+no-negcache
+stop-dns-rebind
+rebind-localhost-ok
+dns-forward-max=150
+no-resolv
+server=1.1.1.1
+server=8.8.8.8
+cache-size=1000
+dhcp-range=10.100.4.10,10.100.4.250,255.255.255.0,12h
+dhcp-option=option:router,10.100.4.1
+dhcp-option=option:dns-server,10.100.4.1
+dhcp-option=option:domain-name,daemondreams.home.arpa
+dhcp-authoritative
+dhcp-rapid-commit
+dhcp-leasefile=/var/lib/misc/dnsmasq.leases
+addn-hosts=/opt/hetzman-tooling/configs/additional-hosts
+log-facility=/var/log/hetzman-tooling/dnsmasq.log
+log-queries=extra
+"""
+
+DC12 = FLEET["htz-hel1-dc12-bm-01"]
+
+
+def test_dnsmasq_conf_reproduces_every_captured_directive():
+    """The single most important safety test: nothing in the live config is
+    silently dropped by the render (would break DHCP/DNS for every VM)."""
+    rendered = render_dnsmasq_conf(DC12, vlan_listen=True).splitlines()
+    for directive in CAPTURED_DC12.splitlines():
+        assert directive in rendered, f"render DROPPED live directive: {directive!r}"
+
+
+def test_dnsmasq_conf_pinned_paths_match_config():
+    from hetzman import config
+    assert DNS_ADDN_HOSTS == config.ADDITIONAL_HOSTS
+
+
+def test_dnsmasq_conf_self_substitution():
+    # DHCP range/router derive from THIS node's bridge_subnet (dc4 -> n=2).
+    conf = render_dnsmasq_conf(SELF, vlan_listen=True)
+    assert "dhcp-range=10.100.2.10,10.100.2.250,255.255.255.0,12h" in conf
+    assert "dhcp-option=option:router,10.100.2.1" in conf
+    assert "dhcp-option=option:dns-server,10.100.2.1" in conf
+    # A node with a DISTINCT vlan/primary iface proves the iface is self-derived
+    # (not a hardcoded constant), per the review.
+    odd = dict(SELF, vlan_interface="bond0.99", primary_interface="bond0")
+    odd_conf = render_dnsmasq_conf(odd, vlan_listen=True)
+    assert "interface=bond0.99" in odd_conf
+    assert "except-interface=bond0" in odd_conf
+    assert "no-dhcp-interface=bond0.99" in odd_conf
+
+
+def test_dnsmasq_conf_vlan_listen_toggle():
+    on = render_dnsmasq_conf(SELF, vlan_listen=True)
+    off = render_dnsmasq_conf(SELF, vlan_listen=False)
+    # vSwitch iface added only when the address is up.
+    assert "interface=enp5s0.4000" in on
+    assert "interface=enp5s0.4000" not in off
+    assert "no-dhcp-interface=enp5s0.4000" in on
+    assert "no-dhcp-interface=enp5s0.4000" not in off
+    # Public iface NEVER bound; always excepted; lo never serves DHCP.
+    for conf in (on, off):
+        assert "except-interface=enp5s0" in conf
+        assert "\ninterface=enp5s0\n" not in conf  # line-anchored: not the public iface
+        assert "no-dhcp-interface=lo" in conf
+
+
+def test_dnsmasq_conf_reverse_zones_scoped():
+    conf = render_dnsmasq_conf(SELF, vlan_listen=True)
+    assert "local=/0.0.10.in-addr.arpa/" in conf
+    assert "local=/100.10.in-addr.arpa/" in conf
+    # NEVER the whole-10/8 reverse zone.
+    assert "local=/10.in-addr.arpa/" not in conf
+    assert DNS_REVERSE_ZONES == ("0.0.10.in-addr.arpa", "100.10.in-addr.arpa")
+
+
+def test_dnsmasq_conf_refuses_to_bind_public_iface():
+    # Misconfig where the vSwitch iface == the public iface must NOT silently
+    # produce an internet-facing resolver.
+    bad = dict(SELF, vlan_interface="enp5s0", primary_interface="enp5s0")
+    with pytest.raises(RenderError):
+        render_dnsmasq_conf(bad, vlan_listen=True)
+
+
+def test_dns_acl_source_predicate():
+    assert dns_acl_source_ok("10.0.0.0/24")
+    assert dns_acl_source_ok("192.168.1.0/24")
+    assert dns_acl_source_ok("10.8.0.5/24")        # host bits ok (strict=False)
+    assert not dns_acl_source_ok("0.0.0.0/0")      # world
+    assert not dns_acl_source_ok("10.0.0.0/8")     # too broad
+    assert not dns_acl_source_ok("1.2.3.0/24")     # public
+    assert not dns_acl_source_ok("not-a-cidr")
+
+
+def test_iptables_dns_acl_scoped_to_vswitch_by_default():
+    text = render_iptables_base(SELF, FLEET)
+    assert "-A INPUT -s 10.0.0.0/24 -p udp -m udp --dport 53 -j ACCEPT" in text
+    assert "-A INPUT -s 10.0.0.0/24 -p tcp -m tcp --dport 53 -j ACCEPT" in text
+
+
+def test_iptables_dns_acl_rejects_unsafe_trusted_cidrs():
+    for bad in ("0.0.0.0/0", "10.0.0.0/8", "1.2.3.0/24"):
+        with pytest.raises(RenderError):
+            render_iptables_base(SELF, FLEET, trusted_dns_clients=[bad])
+        with pytest.raises(RenderError):
+            base_ensure_rules(SELF, FLEET, trusted_dns_clients=[bad])
+
+
+def test_iptables_dns_acl_allows_extra_vpn_cidr():
+    text = render_iptables_base(SELF, FLEET, trusted_dns_clients=["10.0.0.0/24", "192.168.50.0/24"])
+    assert "-s 192.168.50.0/24 -p udp -m udp --dport 53 -j ACCEPT" in text
+
+
+def test_base_ensure_rules_include_scoped_dns_accepts():
+    rules = base_ensure_rules(SELF, FLEET)
+    dns_rules = [r for r in rules if "53" in " ".join(r[2])]
+    assert len(dns_rules) == 2  # udp + tcp for the one default vswitch CIDR
+    for _t, _c, args in dns_rules:
+        assert "10.0.0.0/24" in args
 
 
 def test_netplan_routes_exclude_self():
