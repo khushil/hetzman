@@ -8,10 +8,10 @@ job.
 
 HARD INVARIANT: this module may import ONLY console-free modules
 (``hetzman.etcd_kv``, ``hetzman.registry``, ``hetzman.config``,
-``hetzman.core.models``) plus the standard library.  It must NOT import any
-``hetzman.commands.*`` module nor ``hetzman.network`` (both pull in the Rich
-console).  The subprocess tripwire in ``tests/test_core_import_isolation.py``
-enforces this.
+``hetzman.core.models``, ``hetzman.core.exec``) plus the standard library.  It
+must NOT import any ``hetzman.commands.*`` module nor ``hetzman.network`` (both
+pull in the Rich console).  The console tripwire in
+``tests/test_core_import_isolation.py`` enforces this.
 """
 from __future__ import annotations
 
@@ -20,14 +20,18 @@ import datetime
 from ..config import get_etcd_client, get_settings
 from ..etcd_kv import get_all_with_prefix
 from ..registry import load_registry, validate_registry
+from . import exec as host_exec
+from .errors import CoreError, HostUnreachable
 from .models import (
     DNSRecord,
     FleetNodeStatus,
     FleetStatus,
+    Instance,
     IPAllocation,
     NodeInfo,
     PortForward,
     SystemStatus,
+    UpdateStatus,
 )
 
 IP_POOL_PREFIX = "/hetzman/ip-pool/"
@@ -319,3 +323,63 @@ def _as_int(value: object) -> int | None:
     if isinstance(value, int):
         return value
     return None
+
+
+# ---------------------------------------------------------------------------
+# Instances (VMs + containers) — live, via the host executor
+# ---------------------------------------------------------------------------
+
+
+def list_instances(host: str | None = None) -> tuple[list[Instance], list[str]]:
+    """List Incus instances on ``host``, or fleet-wide when ``host is None``.
+
+    Incus is standalone per host, so the fleet view fans out across every
+    registry node (sequentially — one dead node + an SSH ConnectTimeout would
+    otherwise stall a parallel list). Returns ``(instances, unreachable_hosts)``
+    so a single down/failing node degrades to a partial result instead of
+    failing the whole listing.
+    """
+    if host is not None:
+        data = host_exec.incus_json(host, ["list"])
+        return [Instance.from_incus(host, d) for d in data], []
+
+    registry = load_registry()
+    instances: list[Instance] = []
+    unreachable: list[str] = []
+    for name in sorted(registry):
+        try:
+            data = host_exec.incus_json(name, ["list"], timeout=30)
+        except (HostUnreachable, CoreError):
+            unreachable.append(name)
+            continue
+        instances.extend(Instance.from_incus(name, d) for d in data)
+    return instances, unreachable
+
+
+def check_updates(host: str | None = None) -> UpdateStatus:
+    """Available apt upgrades on ``host`` (read-only — uses the existing cache,
+    never runs ``apt update``)."""
+    res = host_exec.run_on(
+        host, ["apt", "list", "--upgradable"], root=True, check=False, timeout=60
+    )
+    packages: list[str] = []
+    security = 0
+    for line in res.stdout.splitlines():
+        line = line.strip()
+        if not line or line.startswith("Listing"):
+            continue
+        packages.append(line.split("/", 1)[0])
+        if "-security" in line:
+            security += 1
+    target = host or get_settings().current_server or "?"
+    return UpdateStatus(
+        host=target, count=len(packages), packages=tuple(packages), security_count=security
+    )
+
+
+def reboot_required(host: str | None = None) -> bool:
+    """Whether ``host`` is flagged as needing a reboot (``/var/run/reboot-required``)."""
+    res = host_exec.run_on(
+        host, ["test", "-f", "/var/run/reboot-required"], root=True, check=False, timeout=15
+    )
+    return res.returncode == 0

@@ -51,7 +51,34 @@ def _reads_patch():
         patch("hetzman.core.reads.list_ips", return_value=_ips()),
         patch("hetzman.core.reads.list_dns", return_value=_dns()),
         patch("hetzman.core.reads.list_ports", return_value=_ports()),
+        patch("hetzman.core.reads.list_instances", return_value=([], [])),
     ]
+
+
+def test_instances_tab_populates():
+    from hetzman.core.models import Instance
+
+    insts = [
+        Instance("web1", "node-a", "virtual-machine", "Running", 8, "32GB", "250GB", "10.0.5.2"),
+        Instance("ci-1", "node-b", "container", "Running", 4, "8GiB", None, "10.0.5.3"),
+    ]
+
+    async def body():
+        patches = _reads_patch()
+        for p in patches:
+            p.start()
+        try:
+            with patch("hetzman.core.reads.list_instances", return_value=(insts, ["node-c"])):
+                app = HetzmanApp()
+                async with app.run_test() as pilot:
+                    await app.workers.wait_for_complete()
+                    await pilot.pause()
+                    table = app.query_one("#instance-table", DataTable)
+                    assert table.row_count == 2
+        finally:
+            for p in patches:
+                p.stop()
+    _run(body)
 
 
 def test_domain_tabs_populate():

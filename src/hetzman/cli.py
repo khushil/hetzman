@@ -7,7 +7,9 @@ from .apps import app
 from .commands import dns  # noqa: F401
 from .commands import etcd_admin  # noqa: F401
 from .commands import fleet  # noqa: F401
+from .commands import instances  # noqa: F401
 from .commands import ip  # noqa: F401
+from .commands import ops  # noqa: F401
 from .commands import node  # noqa: F401
 from .commands import port  # noqa: F401
 from .commands import system  # noqa: F401

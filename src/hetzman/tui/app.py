@@ -34,10 +34,12 @@ from ..core import ports as core_ports
 from ..core import reads
 from ..core import vms as core_vms
 from ..core.errors import CoreError, EtcdUnavailable
+from ..core.events import ProgressEvent, Severity
 from ..core.models import FleetStatus, SystemStatus
 from .modals import (
     ConfirmModal,
     DnsAddModal,
+    HostPickerModal,
     InstanceNameModal,
     IpAssignModal,
     PortAddModal,
@@ -49,6 +51,7 @@ _FLEET_COLUMNS = ("Node", "Heartbeat", "Checks", "Peers", "Versions", "Sync", "D
 _IP_COLUMNS = ("IP Address", "Server", "Status", "Assigned To")
 _DNS_COLUMNS = ("Hostname", "IP", "Server", "Instance", "Type", "Auto")
 _PORT_COLUMNS = ("Public", "Private", "Protocol", "Instance", "Description", "Enabled")
+_INSTANCE_COLUMNS = ("Name", "Host", "Type", "Status", "CPU", "Mem", "Disk", "Private IP")
 
 # active tab id -> the DataTable id holding that domain's rows
 _DOMAIN_TABLE = {
@@ -74,9 +77,11 @@ class HetzmanCommands(Provider):
             ("Assign public IP", lambda: app.push_add("tab-ips")),
             ("Add DNS record", lambda: app.push_add("tab-dns")),
             ("Add port forward", lambda: app.push_add("tab-ports")),
+            ("Select target host", app.action_pick_host),
             ("Refresh all", app.action_refresh),
             ("Go to: Dashboard", lambda: app.goto("tab-dashboard")),
             ("Go to: Fleet", lambda: app.goto("tab-fleet")),
+            ("Go to: Instances", lambda: app.goto("tab-instances")),
             ("Go to: IPs", lambda: app.goto("tab-ips")),
             ("Go to: DNS", lambda: app.goto("tab-dns")),
             ("Go to: Ports", lambda: app.goto("tab-ports")),
@@ -118,6 +123,11 @@ class HetzmanApp(App):
     FLEET_INTERVAL = 10.0
     SYSTEM_INTERVAL = 30.0
     DOMAIN_INTERVAL = 30.0
+    INSTANCE_INTERVAL = 30.0
+
+    # Target host for mutations (None until picked; defaults to current node on
+    # a fleet node, required on the external command-centre box).
+    target_host: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -132,6 +142,8 @@ class HetzmanApp(App):
                 yield DataTable(id="ip-table", zebra_stripes=True, cursor_type="row")
             with TabPane("DNS", id="tab-dns"):
                 yield DataTable(id="dns-table", zebra_stripes=True, cursor_type="row")
+            with TabPane("Instances", id="tab-instances"):
+                yield DataTable(id="instance-table", zebra_stripes=True, cursor_type="row")
             with TabPane("Ports", id="tab-ports"):
                 yield DataTable(id="port-table", zebra_stripes=True, cursor_type="row")
         yield LogPanel(id="log", max_lines=1000, wrap=True, highlight=False, markup=False)
@@ -142,11 +154,13 @@ class HetzmanApp(App):
         self.query_one("#ip-table", DataTable).add_columns(*_IP_COLUMNS)
         self.query_one("#dns-table", DataTable).add_columns(*_DNS_COLUMNS)
         self.query_one("#port-table", DataTable).add_columns(*_PORT_COLUMNS)
+        self.query_one("#instance-table", DataTable).add_columns(*_INSTANCE_COLUMNS)
         self.query_one(LogPanel).info("hetzman control center started")
         self.action_refresh()
         self.set_interval(self.FLEET_INTERVAL, self._load_fleet)
         self.set_interval(self.SYSTEM_INTERVAL, self._load_system)
         self.set_interval(self.DOMAIN_INTERVAL, self._load_domains)
+        self.set_interval(self.INSTANCE_INTERVAL, self._load_instances)
 
     # ------------------------------------------------------------------ #
     # Navigation helpers
@@ -165,6 +179,25 @@ class HetzmanApp(App):
         self._load_fleet()
         self._load_system()
         self._load_domains()
+        self._load_instances()
+
+    def action_pick_host(self) -> None:
+        def _then(host):
+            if host:
+                self.target_host = host
+                self.sub_title = f"target: {host}"
+                self.query_one(LogPanel).info(f"target host set to {host}")
+        self.run_worker(self._open_host_picker(_then), exclusive=False)
+
+    @work(thread=True, group="hostpicker", exclusive=True)
+    def _open_host_picker(self, callback) -> None:
+        from ..registry import load_registry
+        try:
+            hosts = sorted(load_registry())
+        except Exception as exc:  # pragma: no cover - defensive
+            self.call_from_thread(self.query_one(LogPanel).error, f"host list failed: {exc}")
+            return
+        self.call_from_thread(self.push_screen, HostPickerModal(hosts, self.target_host), callback)
 
     def action_add(self) -> None:
         self.push_add(self._active_tab)
@@ -325,6 +358,18 @@ class HetzmanApp(App):
             return
         self.call_from_thread(self._render_domains, ips, dns, ports)
 
+    @work(thread=True, group="instances", exclusive=True)
+    def _load_instances(self) -> None:
+        try:
+            items, unreachable = reads.list_instances(None)
+        except EtcdUnavailable as exc:
+            self.call_from_thread(self._on_etcd_error, str(exc))
+            return
+        except Exception as exc:  # pragma: no cover - defensive
+            self.call_from_thread(self._on_load_error, "instances", exc)
+            return
+        self.call_from_thread(self._render_instances, items, unreachable)
+
     def _load_into(self, read_fn, render_fn, what: str) -> None:
         try:
             data = read_fn()
@@ -420,6 +465,24 @@ class HetzmanApp(App):
                 p.protocol, p.instance,
                 p.description if p.description is not None else "-",
                 "Yes" if p.enabled else "No",
+            )
+
+    def _render_instances(self, items, unreachable) -> None:
+        table = self.query_one("#instance-table", DataTable)
+        table.clear()
+        for i in sorted(items, key=lambda x: (x.host, x.name)):
+            running = i.status.lower() in ("running", "started")
+            table.add_row(
+                i.name, i.host,
+                "vm" if i.type == "virtual-machine" else (i.type or "?"),
+                Text(i.status, style="green" if running else "red"),
+                "-" if i.cpus is None else str(i.cpus),
+                i.memory or "-", i.disk or "-", i.private_ip or "-",
+            )
+        if unreachable:
+            self.query_one(LogPanel).write_event(
+                ProgressEvent(Severity.WARNING,
+                              f"instances: unreachable hosts skipped: {', '.join(unreachable)}")
             )
 
     # ------------------------------------------------------------------ #

@@ -157,6 +157,46 @@ class PortAddModal(_FormModal):
         }
 
 
+class HostPickerModal(ModalScreen[Optional[str]]):
+    """Pick the target fleet host for subsequent mutations. Dismisses the chosen
+    host name, or None if cancelled."""
+
+    DEFAULT_CSS = """
+    HostPickerModal { align: center middle; }
+    HostPickerModal > Vertical {
+        width: 60; height: auto; max-height: 80%; padding: 1 2;
+        border: thick $accent; background: $surface;
+    }
+    HostPickerModal Label.title { text-style: bold; color: $accent; padding-bottom: 1; }
+    """
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, hosts: list[str], current: Optional[str] = None) -> None:
+        super().__init__()
+        self._hosts = hosts
+        self._current = current
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label("Select target host", classes="title")
+            options = [(h + (" (current)" if h == self._current else ""), h) for h in self._hosts]
+            yield Select(options, id="host", value=self._current or Select.BLANK, allow_blank=True)
+            with Horizontal():
+                yield Button("OK", variant="success", id="ok")
+                yield Button("Cancel", variant="primary", id="cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "ok":
+            value = self.query_one("#host", Select).value
+            self.dismiss(None if value is Select.BLANK else value)
+        else:
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class InstanceNameModal(_FormModal):
     """Single field: an instance/VM name (for delete-by-name actions)."""
 

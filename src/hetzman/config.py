@@ -31,7 +31,9 @@ ETCD_CLIENT_KEY = os.environ.get("HETZMAN_ETCD_CLIENT_KEY", "/opt/hetzman-toolin
 HOST_ROOT_KEYS = "/root/.ssh/authorized_keys"
 # Pinned known_hosts for the SSH executor (host-key checking is strict — vswitch
 # IPs come from the registry this tool can write, so TOFU would be unsafe).
-SSH_KNOWN_HOSTS = os.environ.get("HETZMAN_KNOWN_HOSTS", "/opt/hetzman-tooling/known_hosts")
+# Defaults to root's store (already populated with the fleet's vSwitch host keys
+# from node-to-node SSH); the external box provisions its own via HETZMAN_KNOWN_HOSTS.
+SSH_KNOWN_HOSTS = os.environ.get("HETZMAN_KNOWN_HOSTS", "/root/.ssh/known_hosts")
 
 # Bounded connect-retry: a systemd unit at cold boot may race quorum formation,
 # so non-interactive invocations retry; interactive ones fail fast.

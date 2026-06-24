@@ -22,7 +22,8 @@ def _mock_domain_reads():
     worker never reaches real etcd (these P2 tests only assert dashboard/fleet)."""
     with patch("hetzman.core.reads.list_ips", return_value=[]), \
          patch("hetzman.core.reads.list_dns", return_value=[]), \
-         patch("hetzman.core.reads.list_ports", return_value=[]):
+         patch("hetzman.core.reads.list_ports", return_value=[]), \
+         patch("hetzman.core.reads.list_instances", return_value=([], [])):
         yield
 
 

@@ -305,3 +305,75 @@ class DriftStatus:
     pending: tuple[str, ...]
     warnings: tuple[str, ...]
     errors: tuple[str, ...]
+
+
+# ---------------------------------------------------------------------------
+# Instances (VMs + containers) — live host state, not etcd
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Instance:
+    """An Incus VM or container on a fleet host.
+
+    Source: ``incus list --format json`` on ``host`` (incus is standalone per
+    host, so each node is queried separately). ``disk`` is the root device size
+    and may be ``None`` (some containers carry no explicit root-size quota).
+    """
+
+    name: str
+    host: str
+    type: str           # "virtual-machine" | "container"
+    status: str         # "Running" | "Stopped" | ...
+    cpus: int | None
+    memory: str | None  # e.g. "32GB"
+    disk: str | None    # root device size, e.g. "250GB"; None if unset
+    private_ip: str | None
+
+    @staticmethod
+    def _private_ip(data: dict) -> str | None:
+        net = (data.get("state") or {}).get("network") or {}
+        for iface in ("eth0", "enp5s0"):
+            for addr in (net.get(iface) or {}).get("addresses", []) or []:
+                if addr.get("family") == "inet" and not str(addr.get("address", "")).startswith("127."):
+                    return addr.get("address")
+        return None
+
+    @staticmethod
+    def _root_size(data: dict) -> str | None:
+        # prefer the instance-local device, fall through to profile-expanded
+        for key in ("devices", "expanded_devices"):
+            size = ((data.get(key) or {}).get("root") or {}).get("size")
+            if size:
+                return size
+        return None
+
+    @classmethod
+    def from_incus(cls, host: str, data: dict) -> "Instance":
+        cfg = data.get("config") or {}
+        ecfg = data.get("expanded_config") or {}
+        raw_cpu = cfg.get("limits.cpu") or ecfg.get("limits.cpu")
+        try:
+            cpus = int(raw_cpu) if raw_cpu is not None else None
+        except (TypeError, ValueError):
+            cpus = None
+        return cls(
+            name=data.get("name", ""),
+            host=host,
+            type=data.get("type", ""),
+            status=data.get("status", ""),
+            cpus=cpus,
+            memory=cfg.get("limits.memory") or ecfg.get("limits.memory"),
+            disk=cls._root_size(data),
+            private_ip=cls._private_ip(data),
+        )
+
+
+@dataclass(frozen=True)
+class UpdateStatus:
+    """Available apt updates on a host (read-only; from ``apt list --upgradable``)."""
+
+    host: str
+    count: int
+    packages: tuple[str, ...]
+    security_count: int
