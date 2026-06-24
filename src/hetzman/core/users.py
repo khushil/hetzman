@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import subprocess
 
+from ..logging import log_message
 from ..vm_helpers import check_vm_exists, check_vm_user_exists, run_vm_exec
+from . import exec as host_exec
 from .errors import CoreError, NotFoundError, ValidationError
 from .events import OpResult, ProgressEvent, ProgressGen, Severity
 from .privilege import require_root
@@ -116,3 +118,111 @@ def change_keys(vm_name: str, username: str, key_file: str) -> ProgressGen:
 
     yield ProgressEvent(Severity.SUCCESS, f"Successfully changed keys for user '{username}' on {vm_name}")
     return OpResult(ok=True, summary={"vm": vm_name, "username": username})
+
+
+# --------------------------------------------------------------------------- #
+# Host users — useradd on the bare-metal node itself, via the executor
+# --------------------------------------------------------------------------- #
+def _read_pubkey(key_file: str) -> str:
+    try:
+        with open(key_file) as f:
+            return f.read()
+    except OSError as exc:
+        raise ValidationError(f"cannot read key file {key_file}: {exc}")
+
+
+def _host_step(host: str, argv: list[str], label: str) -> bool:
+    """Run a host command via the executor; False (logged) on failure."""
+    try:
+        host_exec.run_on(host, argv, root=True, timeout=60)
+        return True
+    except CoreError as exc:
+        log_message(f"host user step '{label}' failed on {host}: {exc}", "ERROR")
+        return False
+
+
+def check_host_user_exists(host: str, username: str) -> bool:
+    res = host_exec.run_on(host, ["id", username], root=True, check=False, timeout=15)
+    return res.returncode == 0
+
+
+def add_host_user(host: str, username: str, key_file: str, *, sudo: bool = False) -> ProgressGen:
+    """Create a user on a fleet HOST (not an instance) with an SSH key + sudo."""
+    pubkey = _read_pubkey(key_file)
+    if check_host_user_exists(host, username):
+        raise ValidationError(f"user '{username}' already exists on host {host}")
+
+    yield ProgressEvent(Severity.INFO, f"Creating user '{username}' on host {host}...")
+    ssh_dir = f"/home/{username}/.ssh"
+    auth_keys = f"{ssh_dir}/authorized_keys"
+
+    if not _host_step(host, ["useradd", "-m", "-s", "/bin/bash", username], "useradd"):
+        raise CoreError(f"failed to create user {username} on {host}")
+    # Every post-useradd step is mandatory: a wrong owner/mode makes sshd silently
+    # ignore the key (lockout). On ANY failure, roll the half-made user back.
+    try:
+        if not _host_step(host, ["passwd", "-l", username], "lock password"):
+            yield ProgressEvent(Severity.WARNING, f"could not lock password for {username}")
+        if not _host_step(host, ["mkdir", "-p", ssh_dir], "mkdir .ssh"):
+            raise CoreError("failed to create .ssh directory")
+        # Write the key already-private (umask 077 => 600); no world-readable window.
+        host_exec.run_on(
+            host, ["bash", "-c", f"umask 077 && tee {auth_keys} >/dev/null"],
+            input=pubkey, root=True, timeout=30,
+        )
+        if not _host_step(host, ["chown", "-R", f"{username}:{username}", ssh_dir], "chown"):
+            raise CoreError(f"failed to set owner on {ssh_dir} (sshd would ignore the key)")
+        if not _host_step(host, ["chmod", "700", ssh_dir], "chmod .ssh"):
+            raise CoreError(f"failed to set permissions on {ssh_dir}")
+    except CoreError:
+        _host_step(host, ["userdel", "-r", username], "rollback")  # compensation
+        raise
+
+    if sudo:
+        sudo_file = f"/etc/sudoers.d/90-hetzman-{username}"
+        rule = f"{username} ALL=(ALL) NOPASSWD: ALL"
+        if not _host_step(host, ["bash", "-c", f"echo {rule!r} > {sudo_file}"], "sudo rule"):
+            yield ProgressEvent(Severity.WARNING, "could not apply sudo rule")
+        _host_step(host, ["chmod", "440", sudo_file], "chmod sudoers")
+
+    yield ProgressEvent(Severity.SUCCESS, f"created user '{username}' on host {host}")
+    return OpResult(ok=True, summary={"host": host, "username": username, "sudo": sudo})
+
+
+def remove_host_user(host: str, username: str) -> ProgressGen:
+    """Remove a user (and home dir) from a fleet host."""
+    if username == "root":
+        raise ValidationError("cannot remove root user")
+    if not check_host_user_exists(host, username):
+        raise NotFoundError(f"user '{username}' not found on host {host}")
+    if not _host_step(host, ["userdel", "-r", username], "userdel"):
+        yield ProgressEvent(Severity.ERROR, "failed to remove user; see log")
+    _host_step(host, ["rm", "-f", f"/etc/sudoers.d/90-hetzman-{username}"], "rm sudoers")
+    yield ProgressEvent(Severity.SUCCESS, f"removed user '{username}' from host {host}")
+    return OpResult(ok=True, summary={"host": host, "username": username})
+
+
+def change_host_keys(host: str, username: str, key_file: str) -> ProgressGen:
+    """Replace a host user's authorized_keys ATOMICALLY — a mid-write failure
+    (dropped pipe, full disk, timeout) leaves the original key intact rather than
+    truncating it and locking the user out."""
+    pubkey = _read_pubkey(key_file)
+    if not check_host_user_exists(host, username):
+        raise NotFoundError(f"user '{username}' not found on host {host}")
+    yield ProgressEvent(Severity.INFO, f"Changing SSH key for '{username}' on host {host}...")
+    auth_keys = f"/home/{username}/.ssh/authorized_keys"
+    tmp = f"{auth_keys}.hetzman.tmp"
+    # write temp (private) -> set owner/mode -> rename over the original, only on full success.
+    script = (
+        f"umask 077 && tee {tmp} >/dev/null "
+        f"&& chown {username}:{username} {tmp} && chmod 600 {tmp} && mv {tmp} {auth_keys}"
+    )
+    try:
+        host_exec.run_on(host, ["bash", "-c", script], input=pubkey, root=True, timeout=30)
+    except CoreError:
+        _host_step(host, ["rm", "-f", tmp], "cleanup temp")
+        raise CoreError(
+            f"failed to update keys for {username} on {host}; original key left intact"
+        )
+    yield ProgressEvent(Severity.SUCCESS, f"changed keys for '{username}' on host {host}")
+    return OpResult(ok=True, summary={"host": host, "username": username})

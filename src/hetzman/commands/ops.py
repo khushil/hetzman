@@ -1,5 +1,5 @@
-"""`hetzman ops` — host operational commands. Phase 1 ships the read-only
-checks (available updates, reboot-required); apply/reboot land in Phase 4."""
+"""`hetzman ops` — host operational commands: read-only checks (updates,
+reboot-required) plus guarded apply-updates and reboot."""
 from typing import Optional
 
 import typer
@@ -7,8 +7,10 @@ from rich.table import Table
 
 from ..apps import ops_app
 from ..console import console
+from ..core import ops as core_ops
 from ..core import reads
 from ..registry import load_registry
+from ._render import drive
 
 
 def _hosts(host: Optional[str]) -> list[str]:
@@ -53,3 +55,48 @@ def ops_reboot_required(
             console.print(f"{h}: [red]unreachable[/red] ([dim]{type(exc).__name__}[/dim])")
             continue
         console.print(f"{h}: " + ("[red]reboot required[/red]" if flagged else "[green]ok[/green]"))
+
+
+@ops_app.command("apply-updates")
+def ops_apply_updates(
+    host: str = typer.Option(..., "--host", "-H", help="Host to update"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+):
+    """Apply apt updates on a host (streams apt output)."""
+    if not yes:
+        console.print(f"[yellow]This will run apt-get upgrade on {host}.[/yellow]")
+        if not typer.confirm("Continue?"):
+            raise typer.Exit(code=1)
+    drive(core_ops.apply_updates(host))
+
+
+@ops_app.command("reboot")
+def ops_reboot(
+    host: str = typer.Option(..., "--host", "-H", help="Host to reboot"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the typed confirmation"),
+):
+    """Reboot a host (guarded: refuses if it would break etcd quorum)."""
+    if not yes:
+        console.print(
+            f"[bold red]This will REBOOT host {host}[/bold red] (its VMs/containers go down)."
+        )
+        typed = typer.prompt("Re-type the host name to confirm")
+        if typed != host:
+            console.print("[red]Name mismatch; aborting.[/red]")
+            raise typer.Exit(code=1)
+    drive(core_ops.reboot_host(host))
+
+
+@ops_app.command("rolling-reboot")
+def ops_rolling_reboot(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+):
+    """Reboot every fleet host one at a time (quorum re-checked before each)."""
+    hosts = sorted(load_registry())
+    console.print(f"[bold red]Rolling reboot of {len(hosts)} hosts:[/bold red] {', '.join(hosts)}")
+    if not yes:
+        typed = typer.prompt("Type 'rolling-reboot' to confirm")
+        if typed != "rolling-reboot":
+            console.print("[red]Aborted.[/red]")
+            raise typer.Exit(code=1)
+    drive(core_ops.rolling_reboot(hosts))

@@ -43,8 +43,34 @@ class MemberView:
     id: int
     name: str            # empty string => unstarted / still joining
     peer_hosts: tuple[str, ...]
-    healthy: bool        # responded to a Status RPC
+    healthy: bool        # responded to a Status RPC (liveness only)
     is_leader: bool
+    raft_index: Optional[int] = None  # raft log position (for catch-up checks)
+
+
+# A just-rebooted etcd answers Status the instant its socket is up, while its
+# raft log is still replaying. A member within this many entries of the
+# furthest-ahead voter is considered "caught up" enough to count.
+_MAX_RAFT_LAG = 128
+
+
+def member_caught_up(target_id: int, members: list[MemberView]) -> bool:
+    """True iff the target member is healthy, a stable leader is agreed, and the
+    target's raft log is within _MAX_RAFT_LAG of the furthest-ahead voter.
+
+    Used to gate a rolling reboot: never take the NEXT voter down until the one
+    we just rebooted has genuinely rejoined and caught up (answering Status is
+    NOT enough — it can reply while still replaying its log).
+    """
+    target = next((m for m in members if m.id == target_id), None)
+    if target is None or not target.healthy or target.raft_index is None:
+        return False
+    if not any(m.is_leader for m in members):  # no agreed leader => mid-election
+        return False
+    indices = [m.raft_index for m in members if m.healthy and m.raft_index is not None]
+    if not indices:
+        return False
+    return (max(indices) - target.raft_index) <= _MAX_RAFT_LAG
 
 
 def assess_removal(members: list[MemberView], target_id: int) -> None:
@@ -87,6 +113,40 @@ def assess_removal(members: list[MemberView], target_id: int) -> None:
             f"({healthy_after} healthy after vs quorum {quorum} of {remaining}); "
             "need a margin of at least one"
         )
+
+
+def assess_reboot(members: list[MemberView], target_id: int) -> None:
+    """Raise CoreError if rebooting ``target_id`` would risk etcd quorum.
+
+    A reboot takes the member DOWN transiently but does NOT remove it, so quorum
+    stays that of the FULL cluster (n). The remaining members must keep a quorum
+    of HEALTHY voters while the target is down. (Distinct from assess_removal,
+    which recomputes quorum for the n-1 cluster.)
+    """
+    n = len(members)
+    if any(not m.name for m in members):
+        raise CoreError(
+            "refusing: an etcd member is unstarted/joining (topology mid-transition)"
+        )
+    if not any(m.id == target_id for m in members):
+        raise CoreError(f"target member id {target_id} is not in the cluster")
+    quorum = n // 2 + 1
+    healthy_without = sum(1 for m in members if m.id != target_id and m.healthy)
+    if healthy_without < quorum:
+        raise CoreError(
+            f"refusing reboot: the cluster would lose quorum while this node is down "
+            f"({healthy_without} healthy others < {quorum} quorum of {n})"
+        )
+
+
+def lookup_member(name: str) -> tuple[Optional[MemberView], list[MemberView]]:
+    """Return (this node's etcd member or None, all members) — None when the node
+    is not in the registry or maps to no current member."""
+    entry = load_registry().get(name)
+    if not entry:
+        return None, []
+    members = _member_views()
+    return _try_map(name, entry, members), members
 
 
 def _peer_host(url: str) -> str:
@@ -151,6 +211,7 @@ def _client_for(host: str, port: int):
 class _Probe:
     healthy: bool                 # a Status RPC succeeded (liveness, independent of leader)
     leader_id: Optional[int]      # leader this member reported (None mid-election)
+    raft_index: Optional[int]     # this member's raft log position
 
 
 def _probe_member(member) -> _Probe:
@@ -164,7 +225,7 @@ def _probe_member(member) -> _Probe:
             st = client.status()
             leader = getattr(st, "leader", None)
             lid = leader.id if hasattr(leader, "id") else leader
-            return _Probe(healthy=True, leader_id=lid)
+            return _Probe(healthy=True, leader_id=lid, raft_index=getattr(st, "raft_index", None))
         except Exception:
             continue
         finally:
@@ -173,7 +234,7 @@ def _probe_member(member) -> _Probe:
                     client.close()
                 except Exception:
                     pass
-    return _Probe(healthy=False, leader_id=None)
+    return _Probe(healthy=False, leader_id=None, raft_index=None)
 
 
 def _member_views() -> list[MemberView]:
@@ -201,6 +262,7 @@ def _member_views() -> list[MemberView]:
             peer_hosts=tuple(_peer_host(u) for u in (m.peer_urls or [])),
             healthy=probes[m.id].healthy,
             is_leader=leader_id is not None and m.id == leader_id,
+            raft_index=probes[m.id].raft_index,
         )
         for m in raw
     ]

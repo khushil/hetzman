@@ -130,6 +130,33 @@ class ProbeAndViewsTests(unittest.TestCase):
         self.assertTrue(views[1].is_leader)  # majority (2 of 2 responders) agree leader=1
 
 
+class CaughtUpTests(unittest.TestCase):
+    """member_caught_up gates the rolling reboot — a member answering Status while
+    still replaying its raft log must NOT count as caught up."""
+
+    def _m(self, id, healthy=True, leader=False, raft=100):
+        return MemberView(id=id, name=f"m{id}", peer_hosts=("10.0.0.1",),
+                          healthy=healthy, is_leader=leader, raft_index=raft)
+
+    def test_caught_up_within_lag(self):
+        members = [self._m(1, raft=100), self._m(2, leader=True, raft=110), self._m(3, raft=109)]
+        self.assertTrue(nodes.member_caught_up(1, members))
+
+    def test_lagging_member_not_caught_up(self):
+        members = [self._m(1, raft=10), self._m(2, leader=True, raft=5000), self._m(3, raft=4999)]
+        self.assertFalse(nodes.member_caught_up(1, members))
+
+    def test_no_leader_means_not_caught_up(self):
+        members = [self._m(1, raft=100), self._m(2, raft=110), self._m(3, raft=109)]  # none leader
+        self.assertFalse(nodes.member_caught_up(1, members))
+
+    def test_unhealthy_or_no_raft_index_not_caught_up(self):
+        members = [self._m(1, healthy=False, raft=100), self._m(2, leader=True, raft=110)]
+        self.assertFalse(nodes.member_caught_up(1, members))
+        members = [self._m(1, raft=None), self._m(2, leader=True, raft=110)]
+        self.assertFalse(nodes.member_caught_up(1, members))
+
+
 class MapToMemberTests(unittest.TestCase):
     def test_match_by_etcd_name(self):
         members = [_mv(1, "etcd-a", peer="10.0.0.1"), _mv(2, "etcd-b", peer="10.0.0.2")]

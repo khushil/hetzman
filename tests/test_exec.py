@@ -114,6 +114,16 @@ class RunOnArgvTests(unittest.TestCase):
     @mock.patch("hetzman.core.exec.subprocess.run")
     @mock.patch("hetzman.core.exec.load_registry", return_value=_REGISTRY)
     @mock.patch("hetzman.core.exec.get_settings")
+    def test_input_is_forwarded_to_subprocess(self, gs, reg, run):
+        # the host-user 'tee' key-push relies on input= reaching the ssh subprocess.
+        gs.return_value = _settings(None)  # external -> remote ssh path
+        run.return_value = _completed()
+        ex.run_on("node-a", ["tee", "/x"], input="ssh-ed25519 KEY")
+        self.assertEqual(run.call_args.kwargs["input"], "ssh-ed25519 KEY")
+
+    @mock.patch("hetzman.core.exec.subprocess.run")
+    @mock.patch("hetzman.core.exec.load_registry", return_value=_REGISTRY)
+    @mock.patch("hetzman.core.exec.get_settings")
     def test_incus_json_parses(self, gs, reg, run):
         gs.return_value = _settings("node-a")
         run.return_value = _completed(out='[{"name":"vm1"}]')
