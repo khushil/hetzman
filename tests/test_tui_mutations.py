@@ -52,6 +52,7 @@ def _reads_patch():
         patch("hetzman.core.reads.list_dns", return_value=_dns()),
         patch("hetzman.core.reads.list_ports", return_value=_ports()),
         patch("hetzman.core.reads.list_instances", return_value=([], [])),
+        patch("hetzman.core.reads.list_nodes", return_value=([], [])),
     ]
 
 
@@ -158,6 +159,37 @@ def test_confirm_modal_gates_destructive_mutation():
                     await app.workers.wait_for_complete()
                     await pilot.pause()
                     assert called["n"] == 0
+        finally:
+            for p in patches:
+                p.stop()
+    _run(body)
+
+
+def test_nodes_tab_populates_and_remove_uses_typed_confirm():
+    from hetzman.core.models import NodeInfo
+    from hetzman.tui.modals import TypedConfirmModal
+
+    node = NodeInfo("htz-a", "10.0.0.1", "10.100.1.1", "10.100.1.0/24",
+                    "203.0.113.0/29", "etcd-a", None, {})
+
+    async def body():
+        patches = _reads_patch()
+        for p in patches:
+            p.start()
+        try:
+            with patch("hetzman.core.reads.list_nodes", return_value=([node], [])):
+                app = HetzmanApp()
+                async with app.run_test() as pilot:
+                    await app.workers.wait_for_complete()
+                    await pilot.pause()
+                    table = app.query_one("#node-table", DataTable)
+                    assert table.row_count == 1
+                    app.goto("tab-nodes")
+                    await pilot.pause()
+                    table.move_cursor(row=0)
+                    app.action_remove_node()           # destructive -> typed confirm
+                    await pilot.pause()
+                    assert isinstance(app.screen, TypedConfirmModal)
         finally:
             for p in patches:
                 p.stop()

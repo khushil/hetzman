@@ -29,7 +29,11 @@ from textual.widgets import (
 )
 
 from ..core import dns as core_dns
+from ..core import exec as host_exec
+from ..core import instances as core_instances
 from ..core import ip as core_ip
+from ..core import nodes as core_nodes
+from ..core import ops as core_ops
 from ..core import ports as core_ports
 from ..core import reads
 from ..core import vms as core_vms
@@ -40,9 +44,11 @@ from .modals import (
     ConfirmModal,
     DnsAddModal,
     HostPickerModal,
+    InstanceChangeModal,
     InstanceNameModal,
     IpAssignModal,
     PortAddModal,
+    TypedConfirmModal,
     VmCreateModal,
 )
 from .widgets import Banner, LogPanel
@@ -52,6 +58,7 @@ _IP_COLUMNS = ("IP Address", "Server", "Status", "Assigned To")
 _DNS_COLUMNS = ("Hostname", "IP", "Server", "Instance", "Type", "Auto")
 _PORT_COLUMNS = ("Public", "Private", "Protocol", "Instance", "Description", "Enabled")
 _INSTANCE_COLUMNS = ("Name", "Host", "Type", "Status", "CPU", "Mem", "Disk", "Private IP")
+_NODE_COLUMNS = ("Node", "vSwitch IP", "Bridge", "Public block", "etcd name")
 
 # active tab id -> the DataTable id holding that domain's rows
 _DOMAIN_TABLE = {
@@ -77,11 +84,17 @@ class HetzmanCommands(Provider):
             ("Assign public IP", lambda: app.push_add("tab-ips")),
             ("Add DNS record", lambda: app.push_add("tab-dns")),
             ("Add port forward", lambda: app.push_add("tab-ports")),
+            ("Change instance (cpu/mem/disk)", app.action_change_instance),
+            ("Reboot instance", app.action_reboot_instance),
+            ("Apply updates on a host", app.action_apply_updates),
+            ("Reboot a host", app.action_reboot_host),
+            ("Remove node from fleet", app.action_remove_node),
             ("Select target host", app.action_pick_host),
             ("Refresh all", app.action_refresh),
             ("Go to: Dashboard", lambda: app.goto("tab-dashboard")),
             ("Go to: Fleet", lambda: app.goto("tab-fleet")),
             ("Go to: Instances", lambda: app.goto("tab-instances")),
+            ("Go to: Nodes", lambda: app.goto("tab-nodes")),
             ("Go to: IPs", lambda: app.goto("tab-ips")),
             ("Go to: DNS", lambda: app.goto("tab-dns")),
             ("Go to: Ports", lambda: app.goto("tab-ports")),
@@ -144,6 +157,8 @@ class HetzmanApp(App):
                 yield DataTable(id="dns-table", zebra_stripes=True, cursor_type="row")
             with TabPane("Instances", id="tab-instances"):
                 yield DataTable(id="instance-table", zebra_stripes=True, cursor_type="row")
+            with TabPane("Nodes", id="tab-nodes"):
+                yield DataTable(id="node-table", zebra_stripes=True, cursor_type="row")
             with TabPane("Ports", id="tab-ports"):
                 yield DataTable(id="port-table", zebra_stripes=True, cursor_type="row")
         yield LogPanel(id="log", max_lines=1000, wrap=True, highlight=False, markup=False)
@@ -155,6 +170,7 @@ class HetzmanApp(App):
         self.query_one("#dns-table", DataTable).add_columns(*_DNS_COLUMNS)
         self.query_one("#port-table", DataTable).add_columns(*_PORT_COLUMNS)
         self.query_one("#instance-table", DataTable).add_columns(*_INSTANCE_COLUMNS)
+        self.query_one("#node-table", DataTable).add_columns(*_NODE_COLUMNS)
         self.query_one(LogPanel).info("hetzman control center started")
         self.action_refresh()
         self.set_interval(self.FLEET_INTERVAL, self._load_fleet)
@@ -180,6 +196,89 @@ class HetzmanApp(App):
         self._load_system()
         self._load_domains()
         self._load_instances()
+        self._load_nodes()
+
+    # ---- instance / node / ops actions (selected row drives the target) ----
+    def _selected(self, table_id: str):
+        table = self.query_one(table_id, DataTable)
+        if table.row_count == 0 or table.cursor_row is None:
+            return None
+        return [str(c) for c in table.get_row_at(table.cursor_row)]
+
+    def action_change_instance(self) -> None:
+        row = self._selected("#instance-table")
+        if not row:
+            self.query_one(LogPanel).info("Select an instance row first (Instances tab).")
+            return
+        name, host = row[0], row[1]
+
+        def _then(data):
+            if not data:
+                return
+            remote = ["vm", "change", name, "--yes"]
+            if data["cpus"] is not None:
+                remote += ["--cpus", str(data["cpus"])]
+            if data["memory"]:
+                remote += ["--memory", data["memory"]]
+            if data["disk"]:
+                remote += ["--disk", data["disk"]]
+            self._delegate(host, remote,
+                           lambda: core_instances.change_instance(
+                               name, cpus=data["cpus"], memory=data["memory"], disk=data["disk"]),
+                           f"change {name}")
+
+        self.push_screen(InstanceChangeModal(name, host), _then)
+
+    def action_reboot_instance(self) -> None:
+        row = self._selected("#instance-table")
+        if not row:
+            self.query_one(LogPanel).info("Select an instance row first (Instances tab).")
+            return
+        name, host = row[0], row[1]
+        self._confirm(
+            f"Reboot instance {name} on {host}?",
+            None,
+            f"reboot {name}",
+            delegate=(host, ["vm", "reboot", name, "--yes"],
+                      lambda: core_instances.reboot_instance(name)),
+        )
+
+    def action_apply_updates(self) -> None:
+        self._pick_then(lambda host: self._delegate(
+            host, ["ops", "apply-updates", "--host", host, "--yes"],
+            lambda: core_ops.apply_updates(host), f"apply-updates {host}"))
+
+    def action_reboot_host(self) -> None:
+        def _picked(host):
+            def _confirmed(ok):
+                if ok:
+                    self._delegate(host, ["ops", "reboot", "--host", host, "--yes"],
+                                   lambda: core_ops.reboot_host(host), f"reboot host {host}")
+            self.push_screen(
+                TypedConfirmModal(f"REBOOT host {host} (its VMs/containers go down)", host),
+                _confirmed,
+            )
+        self._pick_then(_picked)
+
+    def action_remove_node(self) -> None:
+        row = self._selected("#node-table")
+        if not row:
+            self.query_one(LogPanel).info("Select a node row first (Nodes tab).")
+            return
+        name = row[0]
+
+        def _confirmed(ok):
+            if ok:
+                self._run_mutation(
+                    lambda: core_nodes.remove_node(name, remove_member=True), f"remove node {name}")
+        self.push_screen(
+            TypedConfirmModal(f"Remove node {name} + its etcd member (guarded)", name),
+            _confirmed,
+        )
+
+    def _pick_then(self, callback) -> None:
+        """Open the host picker, then call back with the chosen host."""
+        self._open_host_picker(callback)
 
     def action_pick_host(self) -> None:
         def _then(host):
@@ -187,7 +286,7 @@ class HetzmanApp(App):
                 self.target_host = host
                 self.sub_title = f"target: {host}"
                 self.query_one(LogPanel).info(f"target host set to {host}")
-        self.run_worker(self._open_host_picker(_then), exclusive=False)
+        self._open_host_picker(_then)
 
     @work(thread=True, group="hostpicker", exclusive=True)
     def _open_host_picker(self, callback) -> None:
@@ -304,15 +403,23 @@ class HetzmanApp(App):
             f"create vm {data['name']}",
         )
 
-    def _confirm(self, message: str, factory, label: str) -> None:
+    def _confirm(self, message: str, factory, label: str, *, delegate=None) -> None:
         def _then(confirmed: bool) -> None:
-            if confirmed:
+            if not confirmed:
+                return
+            if delegate is not None:
+                self._delegate(*delegate, label)
+            else:
                 self._run_mutation(factory, label)
 
         self.push_screen(ConfirmModal(message), _then)
 
+    def _delegate(self, host: str, remote_argv, gen_factory, label: str) -> None:
+        self._run_delegated(host, remote_argv, gen_factory, label)
+
     # ------------------------------------------------------------------ #
-    # Mutation worker: drive a core generator, stream events to the log
+    # Mutation workers: drive a core generator (local) or delegate to the
+    # target node's hetzman over SSH, streaming events into the log.
     # ------------------------------------------------------------------ #
     @work(thread=True, exclusive=False)
     def _run_mutation(self, factory, label: str) -> None:
@@ -332,6 +439,30 @@ class HetzmanApp(App):
             gen.close()
         self.call_from_thread(self._load_domains)
         self.call_from_thread(self._load_system)
+        self.call_from_thread(self._load_instances)
+
+    @work(thread=True, exclusive=False)
+    def _run_delegated(self, host: str, remote_argv, gen_factory, label: str) -> None:
+        log = self.query_one(LogPanel)
+        self.call_from_thread(log.info, f"▶ {label} @ {host}")
+        try:
+            if host_exec.is_local(host):
+                gen = gen_factory()
+                try:
+                    while True:
+                        try:
+                            event = next(gen)
+                        except StopIteration:
+                            break
+                        self.call_from_thread(log.write_event, event)
+                finally:
+                    gen.close()
+            else:
+                for line in host_exec.stream_on(host, ["hetzman", *remote_argv], root=True, timeout=1800):
+                    self.call_from_thread(log.info, line)
+        except (CoreError, Exception) as exc:  # noqa: BLE001 - surface, never crash
+            self.call_from_thread(log.error, f"{label}: {type(exc).__name__}: {exc}")
+        self.call_from_thread(self._load_instances)
 
     # ------------------------------------------------------------------ #
     # Read workers (thread; etcd is blocking)
@@ -369,6 +500,18 @@ class HetzmanApp(App):
             self.call_from_thread(self._on_load_error, "instances", exc)
             return
         self.call_from_thread(self._render_instances, items, unreachable)
+
+    @work(thread=True, group="nodes", exclusive=True)
+    def _load_nodes(self) -> None:
+        try:
+            nodes, errors = reads.list_nodes()
+        except EtcdUnavailable as exc:
+            self.call_from_thread(self._on_etcd_error, str(exc))
+            return
+        except Exception as exc:  # pragma: no cover - defensive
+            self.call_from_thread(self._on_load_error, "nodes", exc)
+            return
+        self.call_from_thread(self._render_nodes, nodes, errors)
 
     def _load_into(self, read_fn, render_fn, what: str) -> None:
         try:
@@ -483,6 +626,20 @@ class HetzmanApp(App):
             self.query_one(LogPanel).write_event(
                 ProgressEvent(Severity.WARNING,
                               f"instances: unreachable hosts skipped: {', '.join(unreachable)}")
+            )
+
+    def _render_nodes(self, nodes, errors) -> None:
+        table = self.query_one("#node-table", DataTable)
+        table.clear()
+        for n in nodes:
+            table.add_row(
+                n.name, n.vswitch_ip,
+                f"{n.bridge_ip} ({n.bridge_subnet})",
+                n.public_block or "-", n.etcd_name or "-",
+            )
+        if errors:
+            self.query_one(LogPanel).write_event(
+                ProgressEvent(Severity.WARNING, f"registry: {'; '.join(errors)}")
             )
 
     # ------------------------------------------------------------------ #

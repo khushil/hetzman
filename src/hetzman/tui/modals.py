@@ -215,6 +215,77 @@ class InstanceNameModal(_FormModal):
         return {"name": name} if name else None
 
 
+class InstanceChangeModal(_FormModal):
+    """Resize an instance: any of cpu / memory / disk (blank = leave unchanged)."""
+
+    title_text = "Change instance"
+
+    def __init__(self, name: str, host: str) -> None:
+        super().__init__()
+        self.title_text = f"Change {name} (on {host})"
+
+    def compose_fields(self) -> ComposeResult:
+        yield Label("vCPUs (blank = unchanged)", classes="field")
+        yield Input(id="cpus", type="integer")
+        yield Label("Memory (e.g. 8GB, blank = unchanged)", classes="field")
+        yield Input(id="memory")
+        yield Label("Root disk (grow-only, e.g. 100GB, blank = unchanged)", classes="field")
+        yield Input(id="disk")
+
+    def collect(self) -> Optional[dict]:
+        cpus = self._val("cpus")
+        out = {
+            "cpus": int(cpus) if cpus else None,
+            "memory": self._val("memory") or None,
+            "disk": self._val("disk") or None,
+        }
+        if not any(out.values()):
+            return None
+        return out
+
+
+class TypedConfirmModal(ModalScreen[bool]):
+    """A destructive confirmation that requires re-typing an exact phrase
+    (the node/host name). Dismisses True only on an exact match."""
+
+    DEFAULT_CSS = """
+    TypedConfirmModal { align: center middle; }
+    TypedConfirmModal > Vertical {
+        width: 70; height: auto; padding: 1 2;
+        border: thick $error; background: $surface;
+    }
+    TypedConfirmModal Label { width: 100%; }
+    TypedConfirmModal Label.warn { color: $error; text-style: bold; padding-bottom: 1; }
+    TypedConfirmModal Horizontal { height: auto; align: center middle; padding-top: 1; }
+    TypedConfirmModal Button { margin: 0 1; }
+    """
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, message: str, phrase: str) -> None:
+        super().__init__()
+        self._message = message
+        self._phrase = phrase
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label(self._message, classes="warn")
+            yield Label(f"Type '{self._phrase}' to confirm:")
+            yield Input(id="phrase")
+            with Horizontal():
+                yield Button("Confirm", variant="error", id="confirm")
+                yield Button("Cancel", variant="primary", id="cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "confirm":
+            self.dismiss(self.query_one("#phrase", Input).value.strip() == self._phrase)
+        else:
+            self.dismiss(False)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
 class VmCreateModal(_FormModal):
     title_text = "Create VM"
 
