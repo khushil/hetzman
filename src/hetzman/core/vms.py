@@ -273,50 +273,12 @@ def change_vm(
     cpus: Optional[int] = None,
     memory: Optional[str] = None,
 ) -> ProgressGen:
-    """Change CPU/memory for a VM (stops, reconfigures, restarts)."""
-    require_root()
-    if cpus is None and memory is None:
-        raise ValidationError("You must specify cpus or memory")
-    if not check_vm_exists(vm_name):
-        raise NotFoundError(f"VM or container '{vm_name}' not found")
+    """Deprecated shim → :func:`hetzman.core.instances.change_instance`.
 
-    started = False
-    try:
-        yield ProgressEvent(Severity.INFO, f"Stopping {vm_name}...")
-        subprocess.run(
-            ["sudo", "incus", "stop", vm_name],
-            check=True, capture_output=True, text=True, timeout=60,
-        )
-        if cpus is not None:
-            yield ProgressEvent(Severity.INFO, f"Applying new CPU limit: {cpus}")
-            subprocess.run(
-                ["sudo", "incus", "config", "set", vm_name, f"limits.cpu={cpus}"],
-                check=True, capture_output=True, text=True, timeout=10,
-            )
-        if memory is not None:
-            yield ProgressEvent(Severity.INFO, f"Applying new memory limit: {memory}")
-            subprocess.run(
-                ["sudo", "incus", "config", "set", vm_name, f"limits.memory={memory}"],
-                check=True, capture_output=True, text=True, timeout=10,
-            )
-        yield ProgressEvent(Severity.INFO, f"Starting {vm_name}...")
-        subprocess.run(
-            ["sudo", "incus", "start", vm_name],
-            check=True, capture_output=True, text=True, timeout=30,
-        )
-        started = True
-        yield ProgressEvent(Severity.SUCCESS, f"Successfully changed limits for {vm_name}")
-        restart_instance_watcher()
-        log_message(f"Changed limits for {vm_name}")
-        return OpResult(ok=True, summary={"name": vm_name})
-    except (subprocess.SubprocessError, OSError) as exc:
-        if not started:
-            # Best-effort: bring the VM back up in its previous state.
-            yield ProgressEvent(Severity.WARNING, "Attempting to restart VM in its previous state...")
-            try:
-                subprocess.run(
-                    ["sudo", "incus", "start", vm_name], capture_output=True, timeout=30
-                )
-            except Exception:
-                pass
-        raise CoreError(f"Error during VM change: {getattr(exc, 'stderr', exc)}")
+    Superseded by ``change_instance`` (which adds disk, container support, and a
+    live-where-possible path instead of the old always-stop/start). Kept for any
+    in-process caller; the CLI/TUI now call ``change_instance`` directly.
+    """
+    from .instances import change_instance
+
+    return change_instance(vm_name, cpus=cpus, memory=memory)

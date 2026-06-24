@@ -143,9 +143,9 @@ class CreateVmTests(unittest.TestCase):
 
 
 class ChangeVmTests(unittest.TestCase):
-    @mock.patch("hetzman.core.vms.check_vm_exists", return_value=True)
-    @mock.patch("hetzman.core.vms.require_root")
-    def test_change_requires_a_field(self, root, exists):
+    @mock.patch("hetzman.core.instances.require_root")
+    def test_change_vm_shim_requires_a_field(self, root):
+        # change_vm now shims to change_instance, which validates after require_root.
         with self.assertRaises(ValidationError):
             _drain(core_vms.change_vm("vm1"))
 

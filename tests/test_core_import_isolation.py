@@ -41,6 +41,7 @@ _MODULES_UNDER_TEST: list[str] = [
     "hetzman.core.users",
     "hetzman.core.vms",
     "hetzman.core.exec",
+    "hetzman.core.instances",
     # decoupled low-level modules
     "hetzman.config",
     "hetzman.logging",

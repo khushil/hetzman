@@ -5,9 +5,11 @@ from rich.table import Table
 
 from ..apps import cfg_app, vm_app
 from ..console import console
+from ..core import instances as core_instances
 from ..core import vms as core_vms
 from ..core.templates import apply_template_gen
 from ..core.vms import PortForwardSpec
+from ._delegate import run_or_delegate
 from ._render import drive
 
 
@@ -85,16 +87,51 @@ def vm_delete(
 
 @vm_app.command("change")
 def vm_change(
-    vm_name: str = typer.Argument(..., help="Name of the VM to modify"),
+    vm_name: str = typer.Argument(..., help="Name of the VM/container to modify"),
     cpus: Optional[int] = typer.Option(None, help="New number of vCPUs"),
     memory: Optional[str] = typer.Option(None, help="New memory amount (e.g., 4GB)"),
+    disk: Optional[str] = typer.Option(None, help="New root disk size (grow-only, e.g. 100GB)"),
+    host: Optional[str] = typer.Option(None, "--host", "-H", help="Target host (default: this node)"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt"),
 ):
-    """Change CPU or memory for a VM (requires restart)"""
-    console.print(f"[yellow]This will stop and restart {vm_name} to apply changes.[/yellow]")
-    if not typer.confirm("Are you sure you want to continue?"):
-        console.print("[red]Change cancelled.[/red]")
+    """Change CPU / memory / disk for a VM or container (live where possible)."""
+    if cpus is None and memory is None and disk is None:
+        console.print("[red]Error: specify at least one of --cpus, --memory, --disk.[/red]")
         raise typer.Exit(code=1)
-    drive(core_vms.change_vm(vm_name, cpus=cpus, memory=memory))
+    if not yes:
+        console.print(f"[yellow]This will change {vm_name} (it may restart to apply).[/yellow]")
+        if not typer.confirm("Continue?"):
+            console.print("[red]Change cancelled.[/red]")
+            raise typer.Exit(code=1)
+    remote = ["vm", "change", vm_name, "--yes"]
+    if cpus is not None:
+        remote += ["--cpus", str(cpus)]
+    if memory is not None:
+        remote += ["--memory", memory]
+    if disk is not None:
+        remote += ["--disk", disk]
+    run_or_delegate(
+        host, remote,
+        lambda: core_instances.change_instance(vm_name, cpus=cpus, memory=memory, disk=disk),
+    )
+
+
+@vm_app.command("reboot")
+def vm_reboot(
+    vm_name: str = typer.Argument(..., help="Name of the VM/container to reboot"),
+    host: Optional[str] = typer.Option(None, "--host", "-H", help="Target host (default: this node)"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt"),
+):
+    """Reboot a VM or container (incus restart)."""
+    if not yes:
+        console.print(f"[yellow]This will reboot {vm_name}.[/yellow]")
+        if not typer.confirm("Continue?"):
+            console.print("[red]Reboot cancelled.[/red]")
+            raise typer.Exit(code=1)
+    run_or_delegate(
+        host, ["vm", "reboot", vm_name, "--yes"],
+        lambda: core_instances.reboot_instance(vm_name),
+    )
 
 
 @cfg_app.command("list")
