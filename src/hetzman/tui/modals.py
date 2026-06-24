@@ -1,0 +1,212 @@
+"""Modal screens for the hetzman control center: confirmation + input forms.
+
+Each input modal ``dismiss``es with a plain dict of field values (or ``None``
+if cancelled); the caller turns that into the core-op call. ConfirmModal
+dismisses with a bool. Keeping the modals dumb (no core calls) means the
+mutation logic lives in one place — the app's mutation worker.
+"""
+from __future__ import annotations
+
+from typing import Optional
+
+from textual.app import ComposeResult
+from textual.containers import Grid, Horizontal, Vertical
+from textual.screen import ModalScreen
+from textual.widgets import Button, Checkbox, Input, Label, Select
+
+
+class ConfirmModal(ModalScreen[bool]):
+    """A yes/no confirmation. Dismisses True (confirm) or False (cancel)."""
+
+    DEFAULT_CSS = """
+    ConfirmModal { align: center middle; }
+    ConfirmModal > Vertical {
+        width: 60; height: auto; padding: 1 2;
+        border: thick $warning; background: $surface;
+    }
+    ConfirmModal Label { width: 100%; padding-bottom: 1; }
+    ConfirmModal Horizontal { height: auto; align: center middle; }
+    ConfirmModal Button { margin: 0 1; }
+    """
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self._message = message
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label(self._message)
+            with Horizontal():
+                yield Button("Confirm", variant="error", id="confirm")
+                yield Button("Cancel", variant="primary", id="cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "confirm")
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
+class _FormModal(ModalScreen[Optional[dict]]):
+    """Base for input forms. Subclasses fill ``fields`` and ``title``."""
+
+    DEFAULT_CSS = """
+    _FormModal { align: center middle; }
+    _FormModal > Vertical {
+        width: 70; height: auto; max-height: 90%; padding: 1 2;
+        border: thick $accent; background: $surface;
+    }
+    _FormModal Label.title { text-style: bold; color: $accent; padding-bottom: 1; }
+    _FormModal Label.field { padding-top: 1; }
+    _FormModal Horizontal { height: auto; align: center middle; padding-top: 1; }
+    _FormModal Button { margin: 0 1; }
+    """
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+    title_text = "Form"
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label(self.title_text, classes="title")
+            yield from self.compose_fields()
+            with Horizontal():
+                yield Button("OK", variant="success", id="ok")
+                yield Button("Cancel", variant="primary", id="cancel")
+
+    def compose_fields(self) -> ComposeResult:  # pragma: no cover - overridden
+        return iter(())
+
+    def collect(self) -> Optional[dict]:  # pragma: no cover - overridden
+        return {}
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "ok":
+            self.dismiss(self.collect())
+        else:
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _val(self, widget_id: str) -> str:
+        return self.query_one(f"#{widget_id}", Input).value.strip()
+
+
+class DnsAddModal(_FormModal):
+    title_text = "Add DNS record"
+
+    def compose_fields(self) -> ComposeResult:
+        yield Label("Hostname (FQDN or short)", classes="field")
+        yield Input(id="hostname", placeholder="web")
+        yield Label("IP address", classes="field")
+        yield Input(id="ip", placeholder="10.0.0.5")
+        yield Label("Instance (optional)", classes="field")
+        yield Input(id="instance")
+
+    def collect(self) -> Optional[dict]:
+        hostname, ip = self._val("hostname"), self._val("ip")
+        if not hostname or not ip:
+            return None
+        return {"hostname": hostname, "ip": ip, "instance": self._val("instance") or None}
+
+
+class IpAssignModal(_FormModal):
+    title_text = "Assign public IP"
+
+    def compose_fields(self) -> ComposeResult:
+        yield Label("Instance name", classes="field")
+        yield Input(id="instance")
+        yield Label("Specific IP (optional, blank = next available)", classes="field")
+        yield Input(id="ip")
+
+    def collect(self) -> Optional[dict]:
+        instance = self._val("instance")
+        if not instance:
+            return None
+        return {"instance": instance, "ip": self._val("ip") or None}
+
+
+class PortAddModal(_FormModal):
+    title_text = "Add port forward"
+
+    def compose_fields(self) -> ComposeResult:
+        yield Label("Instance name", classes="field")
+        yield Input(id="instance")
+        yield Label("Public port", classes="field")
+        yield Input(id="public_port", type="integer")
+        yield Label("Private port", classes="field")
+        yield Input(id="private_port", type="integer")
+        yield Label("Protocol", classes="field")
+        yield Select([("tcp", "tcp"), ("udp", "udp")], id="protocol", value="tcp", allow_blank=False)
+        yield Label("Description (optional)", classes="field")
+        yield Input(id="description")
+
+    def collect(self) -> Optional[dict]:
+        instance = self._val("instance")
+        pub, priv = self._val("public_port"), self._val("private_port")
+        if not instance or not pub or not priv:
+            return None
+        return {
+            "instance": instance,
+            "public_port": int(pub),
+            "private_port": int(priv),
+            "protocol": self.query_one("#protocol", Select).value,
+            "description": self._val("description") or None,
+        }
+
+
+class InstanceNameModal(_FormModal):
+    """Single field: an instance/VM name (for delete-by-name actions)."""
+
+    title_text = "Instance name"
+
+    def __init__(self, title: str = "Instance name") -> None:
+        super().__init__()
+        self.title_text = title
+
+    def compose_fields(self) -> ComposeResult:
+        yield Label("VM / instance name", classes="field")
+        yield Input(id="name")
+
+    def collect(self) -> Optional[dict]:
+        name = self._val("name")
+        return {"name": name} if name else None
+
+
+class VmCreateModal(_FormModal):
+    title_text = "Create VM"
+
+    def compose_fields(self) -> ComposeResult:
+        yield Label("VM name", classes="field")
+        yield Input(id="name")
+        yield Label("Image", classes="field")
+        yield Input(id="image", value="images:ubuntu/24.04/cloud")
+        yield Label("vCPUs", classes="field")
+        yield Input(id="cpus", value="1", type="integer")
+        yield Label("Memory", classes="field")
+        yield Input(id="memory", value="2048MB")
+        yield Label("Disk", classes="field")
+        yield Input(id="disk", value="20GB")
+        yield Label("Network", classes="field")
+        yield Select(
+            [("public", "public"), ("private", "private")],
+            id="network", value="public", allow_blank=False,
+        )
+        yield Label("Template (optional)", classes="field")
+        yield Input(id="template")
+
+    def collect(self) -> Optional[dict]:
+        name = self._val("name")
+        if not name:
+            return None
+        return {
+            "name": name,
+            "image": self._val("image") or "images:ubuntu/24.04/cloud",
+            "cpus": int(self._val("cpus") or "1"),
+            "memory": self._val("memory") or "2048MB",
+            "disk": self._val("disk") or "20GB",
+            "network": self.query_one("#network", Select).value,
+            "template": self._val("template") or None,
+        }

@@ -7,11 +7,23 @@ needing pytest-asyncio.
 import asyncio
 from unittest.mock import patch
 
+import pytest
+
 from hetzman.core.errors import EtcdUnavailable
 from hetzman.core.models import FleetNodeStatus, FleetStatus, SystemStatus
 from hetzman.tui.app import HetzmanApp
 from hetzman.tui.widgets import Banner, LogPanel
 from textual.widgets import DataTable, Static
+
+
+@pytest.fixture(autouse=True)
+def _mock_domain_reads():
+    """on_mount also loads the IP/DNS/Port domain tables; mock those reads so the
+    worker never reaches real etcd (these P2 tests only assert dashboard/fleet)."""
+    with patch("hetzman.core.reads.list_ips", return_value=[]), \
+         patch("hetzman.core.reads.list_dns", return_value=[]), \
+         patch("hetzman.core.reads.list_ports", return_value=[]):
+        yield
 
 
 def _run(coro_factory):
@@ -125,8 +137,13 @@ def test_degraded_fleet_marks_down_node():
 def test_etcd_unavailable_shows_banner_not_crash():
     async def body():
         boom = EtcdUnavailable("Could not connect to etcd cluster")
+        # A real etcd outage fails ALL reads — override the autouse domain mocks
+        # so the successful domain load doesn't clear the banner.
         with patch("hetzman.core.reads.get_fleet_status", side_effect=boom), \
-             patch("hetzman.core.reads.get_system_status", side_effect=boom):
+             patch("hetzman.core.reads.get_system_status", side_effect=boom), \
+             patch("hetzman.core.reads.list_ips", side_effect=boom), \
+             patch("hetzman.core.reads.list_dns", side_effect=boom), \
+             patch("hetzman.core.reads.list_ports", side_effect=boom):
             app = HetzmanApp()
             async with app.run_test() as pilot:
                 await app.workers.wait_for_complete()
