@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import configparser
 import datetime
+import difflib
 import importlib.resources
 import ipaddress
 import json
@@ -39,12 +40,16 @@ from ..registry import (
     validate_registry,
 )
 from ..render import (
+    DNS_LEASEFILE,
+    MANAGED_HEADER,
     RenderError,
+    TRUSTED_DNS_CLIENTS,
     base_ensure_rules,
     base_policies,
-    dnsmasq_conf_lines_to_remove,
+    dns_acl_source_ok,
     iptables_cleanup_plan,
     netplan_semantically_equal,
+    render_dnsmasq_conf,
     render_dnsmasq_include,
     render_iptables_base,
     render_iptables_base_v6,
@@ -62,6 +67,8 @@ RULES_V4_BASE = "/etc/iptables/rules.v4.hetzman-base"
 RULES_V6_BASE = "/etc/iptables/rules.v6.hetzman-base"
 ETCD_CONF = "/etc/etcd.conf"
 STATE_DIR = "/var/lib/hetzman"
+DNSMASQ_DOWN_SENTINEL = "/var/lib/hetzman/dnsmasq-down"
+TRUSTED_DNS_CLIENTS_KEY = "/hetzman/config/trusted-dns-clients"
 LAST_SYNC_FILE = f"{STATE_DIR}/last-node-sync.json"
 SYNC_LOG = "/var/log/hetzman-tooling/node-sync.log"
 
@@ -122,6 +129,188 @@ def _sync_log(lines: List[str]) -> None:
                 f.write(f"[{stamp}] {line}\n")
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# dnsmasq (DNS + DHCP) — managed serving config, safe apply
+
+def _vswitch_addr_up(self_node: dict) -> bool:
+    """True iff this node's vSwitch IP is live on its VLAN interface.
+
+    node-sync only adds the vSwitch listener to dnsmasq.conf when this is True,
+    so a down/not-yet-configured VLAN iface can never make dnsmasq fail to bind
+    on restart (a failure ``dnsmasq --test`` cannot catch)."""
+    res = _run(["ip", "-o", "addr", "show", "dev", self_node["vlan_interface"]], timeout=10)
+    if res.returncode != 0:
+        return False
+    return self_node["vswitch_ip"] in (res.stdout or "")
+
+
+def _systemctl_active(unit: str) -> bool:
+    return (_run(["systemctl", "is-active", unit], timeout=10).stdout or "").strip() == "active"
+
+
+def _dnsmasq_serving(self_node: dict, *, check_dhcp: bool) -> Tuple[bool, str]:
+    """Poll up to ~8s (> dnsmasq.service RestartSec=5) for dnsmasq to be fully
+    serving. Returns (ok, reason). ``--test`` + a forward dig can both pass while
+    DHCP is dead, so we additionally check the :67 listener and the leasefile."""
+    last = "unknown"
+    for _ in range(8):
+        if not _systemctl_active("dnsmasq"):
+            last = "service not active"
+            time.sleep(1)
+            continue
+        fwd = _run(["dig", "+short", "+time=2", "+tries=1", "@127.0.0.1",
+                    f"{self_node['name']}.{DOMAIN}"], timeout=10)
+        if not (fwd.stdout or "").strip():
+            last = "forward dig empty"
+            time.sleep(1)
+            continue
+        rev = _run(["dig", "+short", "+time=2", "+tries=1", "-x", self_node["vswitch_ip"],
+                    "@127.0.0.1"], timeout=10)
+        if self_node["name"] not in (rev.stdout or ""):
+            last = "reverse dig mismatch"
+            time.sleep(1)
+            continue
+        if check_dhcp:
+            ss = _run(["ss", "-ulnp", "sport = :67"], timeout=10)
+            if "dnsmasq" not in (ss.stdout or ""):
+                last = "DHCP :67 listener gone"
+                time.sleep(1)
+                continue
+            try:
+                if os.path.getsize(DNS_LEASEFILE) <= 0:
+                    last = "leasefile empty"
+                    time.sleep(1)
+                    continue
+            except OSError:
+                last = "leasefile missing"
+                time.sleep(1)
+                continue
+        return True, "ok"
+    return False, last
+
+
+def _clear_dnsmasq_sentinel() -> None:
+    try:
+        os.unlink(DNSMASQ_DOWN_SENTINEL)
+    except OSError:
+        pass
+
+
+def _trusted_dns_clients() -> List[str]:
+    """Trusted :53 source CIDRs: always the vSwitch, plus any operator-configured
+    VPN CIDRs from etcd. Fail-closed (narrower) — a malformed/oversized value is
+    logged and dropped, never widening the ACL and never aborting node-sync."""
+    trusted = list(TRUSTED_DNS_CLIENTS)
+    try:
+        raw = get_all_with_prefix(TRUSTED_DNS_CLIENTS_KEY).get(TRUSTED_DNS_CLIENTS_KEY)
+        cidrs = raw if isinstance(raw, list) else (raw.get("cidrs") if isinstance(raw, dict) else [])
+        for cidr in cidrs or []:
+            if dns_acl_source_ok(str(cidr)):
+                if cidr not in trusted:
+                    trusted.append(str(cidr))
+            else:
+                _sync_log([f"trusted-dns-clients: rejected unsafe CIDR {cidr!r} (not RFC1918/too broad)"])
+    except Exception as e:  # noqa: BLE001 — must never break node-sync
+        _sync_log([f"trusted-dns-clients: read/parse failed, using vSwitch only: {e}"])
+    return trusted
+
+
+def _apply_dnsmasq(
+    self_node: dict,
+    *,
+    include_drift: bool,
+    desired_include: str,
+    conf_drift: bool,
+    conf_is_managed: bool,
+    desired_conf: str,
+) -> Tuple[List[str], List[str]]:
+    """Write the dnsmasq include + full conf, then ONE restart + verify, with a
+    test-before-write and an escalating rollback. Returns (changed, errors).
+
+    Safety properties (each unit-tested):
+    * the candidate conf is ``dnsmasq --test``ed BEFORE the live file is touched;
+    * a ``.rollback`` snapshot is taken every apply and restored on ANY failed
+      post-apply check (active + forward + reverse + DHCP :67 + leasefile);
+    * if even the rollback isn't serving, escalate (CRITICAL log + a
+      ``dnsmasq-down`` sentinel) instead of leaving DHCP silently dead.
+    """
+    changed: List[str] = []
+    errors: List[str] = []
+    needs_restart = False
+
+    if include_drift:
+        try:
+            _write(DNSMASQ_INCLUDE, desired_include)
+            changed.append("dnsmasq-include")
+            needs_restart = True
+        except OSError as e:
+            errors.append(f"dnsmasq include: {e}")
+
+    conf_rollback = None
+    if conf_drift:
+        try:
+            # one-time pre-management backup of the hand-rolled conf
+            if not conf_is_managed and os.path.exists(DNSMASQ_CONF):
+                premanage = DNSMASQ_CONF + ".bak-hetzman-premanage"
+                if not os.path.exists(premanage):
+                    shutil.copy2(DNSMASQ_CONF, premanage)
+            # rollback snapshot every apply (exact prior bytes to restore to)
+            if os.path.exists(DNSMASQ_CONF):
+                conf_rollback = DNSMASQ_CONF + ".rollback"
+                shutil.copy2(DNSMASQ_CONF, conf_rollback)
+            # TEST the candidate BEFORE the live file is ever touched
+            candidate = DNSMASQ_CONF + ".candidate"
+            _write(candidate, desired_conf)
+            test = _run(["dnsmasq", "--test", f"--conf-file={candidate}",
+                         "--conf-dir=/etc/dnsmasq.d,.dpkg-dist,.dpkg-old,.dpkg-new"])
+            try:
+                os.unlink(candidate)
+            except OSError:
+                pass
+            if test.returncode != 0:
+                errors.append(f"dnsmasq.conf --test failed (not applied): {test.stderr.strip()}")
+            else:
+                _write(DNSMASQ_CONF, desired_conf)
+                changed.append("dnsmasq.conf" if conf_is_managed else "dnsmasq.conf-adopt")
+                needs_restart = True
+        except OSError as e:
+            errors.append(f"dnsmasq.conf write: {e}")
+
+    if not needs_restart:
+        return changed, errors
+
+    _run(["systemctl", "restart", "dnsmasq"])
+    ok, reason = _dnsmasq_serving(self_node, check_dhcp=True)
+    if ok:
+        _clear_dnsmasq_sentinel()
+        return changed, errors
+
+    # roll the conf back to the known-good bytes and restart
+    errors.append(f"dnsmasq post-apply check failed ({reason}); rolling back")
+    _sync_log([f"dnsmasq post-apply failed ({reason}); rolling back dnsmasq.conf"])
+    if conf_rollback and os.path.exists(conf_rollback):
+        try:
+            shutil.copy2(conf_rollback, DNSMASQ_CONF)
+        except OSError as e:
+            errors.append(f"dnsmasq.conf rollback copy failed: {e}")
+    _run(["systemctl", "restart", "dnsmasq"])
+    ok2, reason2 = _dnsmasq_serving(self_node, check_dhcp=True)
+    if ok2:
+        _clear_dnsmasq_sentinel()
+        return changed, errors
+
+    # ESCALATE: even the rollback isn't serving — DHCP/DNS is down.
+    msg = f"CRITICAL: dnsmasq down after rollback ({reason2})"
+    log_message(msg, "ERROR")
+    _sync_log([msg])
+    try:
+        _write(DNSMASQ_DOWN_SENTINEL, f"{reason2}\n")
+    except OSError:
+        pass
+    errors.append(msg)
+    return changed, errors
 
 
 # ---------------------------------------------------------------------------
@@ -349,9 +538,11 @@ def _rule_variants(args: List[str]) -> List[List[str]]:
     return variants
 
 
-def _iptables_live_missing(self_node: dict, nodes: Dict[str, dict]) -> List[Tuple[str, str, List[str]]]:
+def _iptables_live_missing(
+    self_node: dict, nodes: Dict[str, dict], trusted_dns_clients: Optional[List[str]] = None
+) -> List[Tuple[str, str, List[str]]]:
     missing = []
-    for table, chain, args in base_ensure_rules(self_node, nodes):
+    for table, chain, args in base_ensure_rules(self_node, nodes, trusted_dns_clients):
         present = any(
             _run(["iptables", "-w", "5", "-t", table, "-C", chain, *variant], timeout=10).returncode == 0
             for variant in _rule_variants(args)
@@ -429,10 +620,22 @@ def _node_sync_run(apply: bool) -> int:
     if include_drift:
         pending.append("dnsmasq-include")
 
+    # Full managed dnsmasq.conf (DNS + DHCP). The render supersedes the legacy
+    # host-record migration (it never emits host-record lines). vlan_listen is
+    # gated on the vSwitch address being live so the candidate can always bind.
     conf_text = _read(DNSMASQ_CONF) or ""
-    doomed_lines = dnsmasq_conf_lines_to_remove(conf_text, nodes)
-    if doomed_lines:
-        pending.append(f"dnsmasq.conf-migration({len(doomed_lines)} lines)")
+    conf_is_managed = conf_text.startswith(MANAGED_HEADER)
+    vlan_listen = _vswitch_addr_up(self_node)
+    try:
+        desired_conf = render_dnsmasq_conf(self_node, vlan_listen=vlan_listen)
+    except RenderError as e:
+        console.print(f"[red]render dnsmasq.conf: {e}[/red]")
+        _sync_log([f"render dnsmasq.conf failed: {e}"])
+        _write_state("error", changed, errors=[str(e)])
+        return 3
+    conf_drift = conf_text != desired_conf
+    if conf_drift:
+        pending.append("dnsmasq.conf" if conf_is_managed else "dnsmasq.conf-adopt")
 
     desired_netplan = render_netplan_vswitch(self_node, nodes)
     netplan_on_disk = _read(NETPLAN_VSWITCH) or ""
@@ -447,8 +650,9 @@ def _node_sync_run(apply: bool) -> int:
             f"{NETPLAN_BRIDGE} does not contain bridge_ip {self_node['bridge_ip']} (not auto-managed)"
         )
 
+    trusted_dns = _trusted_dns_clients()
     try:
-        desired_base_v4 = render_iptables_base(self_node, nodes)
+        desired_base_v4 = render_iptables_base(self_node, nodes, trusted_dns_clients=trusted_dns)
         desired_base_v6 = render_iptables_base_v6()
     except RenderError as e:
         console.print(f"[red]render: {e}[/red]")
@@ -460,7 +664,7 @@ def _node_sync_run(apply: bool) -> int:
     if base_drift or base_v6_drift:
         pending.append("iptables-base")
 
-    live_missing = _iptables_live_missing(self_node, nodes)
+    live_missing = _iptables_live_missing(self_node, nodes, trusted_dns)
     live_save = _run(["iptables-save"], timeout=15).stdout or ""
     deletions, cleanup_warnings = iptables_cleanup_plan(live_save, nodes)
     warnings.extend(cleanup_warnings)
@@ -477,6 +681,17 @@ def _node_sync_run(apply: bool) -> int:
     if not apply:
         for warning in warnings:
             console.print(f"[yellow]warn: {warning}[/yellow]")
+        if conf_drift:
+            # Surface exactly what a (safety-critical) dnsmasq.conf apply would change.
+            diff = list(difflib.unified_diff(
+                conf_text.splitlines(), desired_conf.splitlines(),
+                fromfile="dnsmasq.conf (live)", tofile="dnsmasq.conf (desired)", lineterm="",
+            ))
+            if diff:
+                console.print("[cyan]dnsmasq.conf diff:[/cyan]")
+                for line in diff[:80]:
+                    color = "green" if line.startswith("+") else "red" if line.startswith("-") else "dim"
+                    console.print(f"[{color}]{line}[/{color}]")
         if pending:
             console.print(f"[yellow]Drift detected: {', '.join(pending)}[/yellow]")
             return 1
@@ -490,39 +705,13 @@ def _node_sync_run(apply: bool) -> int:
         else:
             errors.append("config.ini write failed")
 
-    dnsmasq_needs_restart = False
-    if include_drift:
-        try:
-            _write(DNSMASQ_INCLUDE, desired_include)
-            changed.append("dnsmasq-include")
-            dnsmasq_needs_restart = True
-        except OSError as e:
-            errors.append(f"dnsmasq include: {e}")
-
-    if doomed_lines:
-        backup = DNSMASQ_CONF + ".bak-hetzman-migration"
-        try:
-            if not os.path.exists(backup):
-                shutil.copy2(DNSMASQ_CONF, backup)
-            kept = [l for l in conf_text.splitlines() if l not in doomed_lines]
-            _write(DNSMASQ_CONF, "\n".join(kept) + "\n")
-            changed.append("dnsmasq.conf-migration")
-            dnsmasq_needs_restart = True
-        except OSError as e:
-            errors.append(f"dnsmasq.conf migration: {e}")
-
-    if dnsmasq_needs_restart:
-        test = _run(["dnsmasq", "--test", f"--conf-file={DNSMASQ_CONF}",
-                     "--conf-dir=/etc/dnsmasq.d,.dpkg-dist,.dpkg-old,.dpkg-new"])
-        if test.returncode != 0:
-            errors.append(f"dnsmasq --test failed: {test.stderr.strip()}")
-        else:
-            _run(["systemctl", "restart", "dnsmasq"])
-            time.sleep(1)
-            dig = _run(["dig", "+short", "+time=2", "+tries=1", "@127.0.0.1",
-                        f"{self_node['name']}.{DOMAIN}"])
-            if not dig.stdout.strip():
-                errors.append("post-restart dig check failed")
+    d_changed, d_errors = _apply_dnsmasq(
+        self_node,
+        include_drift=include_drift, desired_include=desired_include,
+        conf_drift=conf_drift, conf_is_managed=conf_is_managed, desired_conf=desired_conf,
+    )
+    changed.extend(d_changed)
+    errors.extend(d_errors)
 
     if netplan_drift:
         backup = f"{NETPLAN_VSWITCH}.bak-{int(time.time())}"
