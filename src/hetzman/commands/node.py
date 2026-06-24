@@ -51,6 +51,7 @@ from ..render import (
     render_netplan_vswitch,
     DOMAIN,
 )
+from ._render import drive
 from .system import do_sync_apply
 
 DNSMASQ_CONF = "/etc/dnsmasq.conf"
@@ -252,37 +253,57 @@ def node_show(name: str = typer.Argument(..., help="Node name")):
     console.print(json.dumps(nodes[name], indent=2))
 
 
+@node_app.command("add")
+def node_add(
+    name: str = typer.Argument(..., help="Node (server) name"),
+    vswitch_ip: str = typer.Option(..., help="Internal vSwitch IP (e.g. 10.0.0.5)"),
+    bridge_ip: str = typer.Option(..., help="Incus bridge IP (e.g. 10.100.5.1)"),
+    public_block: str = typer.Option(..., help="Routed public block CIDR"),
+    primary_interface: str = typer.Option(..., help="Physical interface (e.g. enp5s0)"),
+    vlan_interface: str = typer.Option(..., help="VLAN interface (e.g. enp5s0.4000)"),
+    vlan_id: int = typer.Option(..., help="VLAN id (e.g. 4000)"),
+    mtu: int = typer.Option(1400, help="vSwitch MTU"),
+    etcd_name: str = typer.Option(..., help="The node's etcd member name (ETCD_NAME)"),
+):
+    """Register a node's topology in the fleet registry (registry-only).
+
+    NOTE: this does NOT add the etcd cluster member. The new box must be
+    provisioned (etcd installed + joined as a member, hetzman installed) before
+    node-sync will converge — full remote provisioning is a separate command.
+    """
+    from ..core import nodes as core_nodes
+
+    drive(core_nodes.register_node(
+        name=name, vswitch_ip=vswitch_ip, bridge_ip=bridge_ip, public_block=public_block,
+        primary_interface=primary_interface, vlan_interface=vlan_interface,
+        vlan_id=vlan_id, mtu=mtu, etcd_name=etcd_name,
+    ))
+
+
 @node_app.command("remove")
 def node_remove(
     name: str = typer.Argument(..., help="Node name"),
+    remove_member: bool = typer.Option(
+        False, "--remove-member", help="Also remove the node's etcd cluster member (guarded)"
+    ),
     force: bool = typer.Option(False, "--force", help="Remove even with referencing NAT/pool/DNS rows"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the typed confirmation"),
 ):
-    """Remove a node from the registry (pair with `etcdctl member remove`)"""
-    nodes = load_registry()
-    if name not in nodes:
-        console.print(f"[red]{name} not in registry[/red]")
-        raise typer.Exit(code=1)
+    """Remove a node from the registry (and optionally its etcd cluster member)."""
+    from ..core import nodes as core_nodes
 
-    refs: List[str] = []
-    if get_all_with_prefix(f"/hetzman/nat/{name}/"):
-        refs.append("NAT rules")
-    if any(r.get("server") == name for r in get_all_with_prefix("/hetzman/ip-pool/").values() if isinstance(r, dict)):
-        refs.append("ip-pool rows")
-    if any(r.get("server") == name for r in get_all_with_prefix("/hetzman/dns/").values() if isinstance(r, dict)):
-        refs.append("DNS records")
-    if refs and not force:
-        console.print(f"[red]{name} is still referenced by: {', '.join(refs)} (use --force to override)[/red]")
-        raise typer.Exit(code=1)
+    if remove_member and not yes:
+        # Typed confirmation: a wrong target can break the production quorum.
+        console.print(
+            f"[bold red]This will remove etcd cluster member for '{name}'.[/bold red]\n"
+            "[yellow]Re-type the node name to confirm:[/yellow]"
+        )
+        typed = typer.prompt("node name")
+        if typed != name:
+            console.print("[red]Name mismatch; aborting.[/red]")
+            raise typer.Exit(code=1)
 
-    if not delete_key(NODES_PREFIX + name):
-        console.print("[red]etcd delete failed[/red]")
-        raise typer.Exit(code=1)
-    console.print(f"[green]Removed {name} from the registry[/green]")
-    console.print(
-        "[yellow]Reminder: node-sync is now inert fleet-wide until the etcd member "
-        "is also removed (registry must 1:1 match members). This fail-closed freeze "
-        "is intended.[/yellow]"
-    )
+    drive(core_nodes.remove_node(name, remove_member=remove_member, force=force))
 
 
 # ---------------------------------------------------------------------------
