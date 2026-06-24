@@ -51,13 +51,17 @@ def _drain_silent(gen) -> None:
         pass
 
 
-def _incus_launch(vm_name: str, image: str, cpus: int, memory: str, disk: str) -> None:
+def _incus_launch(
+    vm_name: str, image: str, cpus: int, memory: str, disk: str, instance_type: str = "vm"
+) -> None:
     cmd = [
-        "sudo", "incus", "launch", image, vm_name, "--vm",
+        "sudo", "incus", "launch", image, vm_name,
         "-c", f"limits.cpu={cpus}",
         "-c", f"limits.memory={memory}",
         "-d", f"root,size={disk}",
     ]
+    if instance_type == "vm":
+        cmd.insert(5, "--vm")  # containers are incus's default; --vm makes it a VM
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
     except subprocess.CalledProcessError as exc:
@@ -107,9 +111,13 @@ def create_vm(
     network_type: str = "public",
     port_forwards: Sequence[PortForwardSpec] = (),
     template: Optional[str] = None,
+    instance_type: str = "vm",
 ) -> ProgressGen:
-    """Create, configure, secure, and optionally provision a new Incus VM."""
+    """Create, configure, secure, and optionally provision a new Incus instance
+    (``instance_type`` = ``"vm"`` or ``"container"``)."""
     require_root()
+    if instance_type not in ("vm", "container"):
+        raise ValidationError("instance_type must be 'vm' or 'container'")
     if check_vm_exists(vm_name):
         raise ValidationError(f"VM or container '{vm_name}' already exists")
     if network_type not in ("public", "private"):
@@ -121,10 +129,10 @@ def create_vm(
     undo: list[tuple[str, callable]] = []
 
     try:
-        yield ProgressEvent(Severity.STEP, "Launching instance", 1, 5)
-        _incus_launch(vm_name, image, cpus, memory, disk)
+        yield ProgressEvent(Severity.STEP, f"Launching {instance_type}", 1, 5)
+        _incus_launch(vm_name, image, cpus, memory, disk, instance_type)
         undo.append(("instance", lambda: _incus_stop_delete(vm_name)))
-        yield ProgressEvent(Severity.SUCCESS, f"VM {vm_name} launched")
+        yield ProgressEvent(Severity.SUCCESS, f"{instance_type} {vm_name} launched")
 
         yield ProgressEvent(Severity.STEP, "Waiting for private IP", 2, 5)
         private_ip = _wait_private_ip(vm_name)
@@ -186,6 +194,7 @@ def create_vm(
             ok=True,
             summary={
                 "name": vm_name,
+                "type": instance_type,
                 "image": image,
                 "cpus": cpus,
                 "memory": memory,

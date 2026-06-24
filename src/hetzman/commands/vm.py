@@ -15,7 +15,8 @@ from ._render import drive
 
 @vm_app.command("create")
 def vm_create(
-    vm_name: str = typer.Argument(..., help="Name for the new VM"),
+    vm_name: str = typer.Argument(..., help="Name for the new VM or container"),
+    type: str = typer.Option("vm", "--type", help="Instance type: 'vm' or 'container'"),
     image: str = typer.Option("images:ubuntu/24.04/cloud", help="Incus image to use"),
     cpus: int = typer.Option(1, help="Number of vCPUs"),
     memory: str = typer.Option("2048MB", help="Memory (e.g., 512MB, 2GB)"),
@@ -26,7 +27,7 @@ def vm_create(
         None, "--template", help="Provisioning template to apply (see 'hetzman vm cfg list')"
     ),
 ):
-    """Create, configure, and secure a new Incus VM"""
+    """Create, configure, and secure a new Incus VM or container (--type)."""
     # Interactive port-forward collection is a CLI concern (the TUI uses a form).
     port_forwards: list[PortForwardSpec] = []
     if port_forward and network == "public":
@@ -52,6 +53,7 @@ def vm_create(
             network_type=network,
             port_forwards=port_forwards,
             template=template,
+            instance_type=type,
         )
     )
 
@@ -61,6 +63,7 @@ def vm_create(
         table.add_column("Property", style="cyan")
         table.add_column("Value", style="green")
         table.add_row("Name", str(s["name"]))
+        table.add_row("Type", str(s.get("type", "vm")))
         table.add_row("Image", str(s["image"]))
         table.add_row("vCPUs", str(s["cpus"]))
         table.add_row("Memory", str(s["memory"]))

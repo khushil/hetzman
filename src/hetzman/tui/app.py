@@ -128,8 +128,12 @@ class HetzmanApp(App):
 
     BINDINGS = [
         ("r", "refresh", "Refresh"),
+        ("n", "create_vm", "New VM/ctr"),
         ("a", "add", "Add"),
+        ("c", "change_instance", "Change"),
+        ("b", "reboot_instance", "Reboot"),
         ("d", "delete", "Delete"),
+        ("ctrl+p", "command_palette", "More…"),
         ("q", "quit", "Quit"),
     ]
 
@@ -395,13 +399,15 @@ class HetzmanApp(App):
     def _on_vm_create(self, data) -> None:
         if not data:
             return
+        itype = data.get("type", "vm")
         self._run_mutation(
             lambda: core_vms.create_vm(
                 data["name"], image=data["image"], cpus=data["cpus"],
                 memory=data["memory"], disk=data["disk"],
                 network_type=data["network"], template=data["template"],
+                instance_type=itype,
             ),
-            f"create vm {data['name']}",
+            f"create {itype} {data['name']}",
         )
 
     def _confirm(self, message: str, factory, label: str, *, delegate=None) -> None:
@@ -532,7 +538,19 @@ class HetzmanApp(App):
     # ------------------------------------------------------------------ #
     # Render (UI thread)
     # ------------------------------------------------------------------ #
+    def _overlay_active(self) -> bool:
+        """True when a modal or the command palette is on top. Background
+        refreshes must not repaint (or query) through it — ``query_one`` would
+        search the overlay screen and raise ``NoMatches``."""
+        return len(self.screen_stack) > 1
+
+    def _base_query(self, selector):
+        """query_one against the base screen, regardless of any active overlay."""
+        return self.screen_stack[0].query_one(selector)
+
     def _render_fleet(self, fleet: FleetStatus) -> None:
+        if self._overlay_active():
+            return
         self.query_one(Banner).clear()
         table = self.query_one("#fleet-table", DataTable)
         table.clear()
@@ -563,6 +581,8 @@ class HetzmanApp(App):
         )
 
     def _render_system(self, status: SystemStatus) -> None:
+        if self._overlay_active():
+            return
         self.query_one(Banner).clear()
         text = Text()
         text.append(f"HetzMan Status — {status.server}\n\n", style="bold cyan")
@@ -586,6 +606,8 @@ class HetzmanApp(App):
         self.query_one("#system-card", Static).update(text)
 
     def _render_domains(self, ips, dns, ports, dns_status=None) -> None:
+        if self._overlay_active():
+            return
         self.query_one(Banner).clear()
 
         card = self.query_one("#dns-server-card", Static)
@@ -632,6 +654,8 @@ class HetzmanApp(App):
             )
 
     def _render_instances(self, items, unreachable) -> None:
+        if self._overlay_active():
+            return
         table = self.query_one("#instance-table", DataTable)
         table.clear()
         for i in sorted(items, key=lambda x: (x.host, x.name)):
@@ -650,6 +674,8 @@ class HetzmanApp(App):
             )
 
     def _render_nodes(self, nodes, errors) -> None:
+        if self._overlay_active():
+            return
         table = self.query_one("#node-table", DataTable)
         table.clear()
         for n in nodes:
@@ -667,11 +693,12 @@ class HetzmanApp(App):
     # Error handling (UI thread)
     # ------------------------------------------------------------------ #
     def _on_etcd_error(self, message: str) -> None:
-        self.query_one(Banner).show(f"etcd unavailable: {message}")
-        self.query_one(LogPanel).error(f"etcd unavailable: {message}")
+        # base-screen queries so an error during a modal/palette still surfaces
+        self._base_query(Banner).show(f"etcd unavailable: {message}")
+        self._base_query(LogPanel).error(f"etcd unavailable: {message}")
 
     def _on_load_error(self, what: str, exc: Exception) -> None:
-        self.query_one(LogPanel).error(f"{what} refresh failed: {type(exc).__name__}: {exc}")
+        self._base_query(LogPanel).error(f"{what} refresh failed: {type(exc).__name__}: {exc}")
 
 
 def run() -> None:

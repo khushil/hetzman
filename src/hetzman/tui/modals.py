@@ -287,11 +287,16 @@ class TypedConfirmModal(ModalScreen[bool]):
 
 
 class VmCreateModal(_FormModal):
-    title_text = "Create VM"
+    title_text = "Create VM / container"
 
     def compose_fields(self) -> ComposeResult:
-        yield Label("VM name", classes="field")
+        yield Label("Name", classes="field")
         yield Input(id="name")
+        yield Label("Type", classes="field")
+        yield Select(
+            [("vm", "vm"), ("container", "container")],
+            id="type", value="vm", allow_blank=False,
+        )
         yield Label("Image", classes="field")
         yield Input(id="image", value="images:ubuntu/24.04/cloud")
         yield Label("vCPUs", classes="field")
@@ -314,6 +319,7 @@ class VmCreateModal(_FormModal):
             return None
         return {
             "name": name,
+            "type": self.query_one("#type", Select).value,
             "image": self._val("image") or "images:ubuntu/24.04/cloud",
             "cpus": int(self._val("cpus") or "1"),
             "memory": self._val("memory") or "2048MB",

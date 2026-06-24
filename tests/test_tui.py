@@ -159,6 +159,31 @@ def test_etcd_unavailable_shows_banner_not_crash():
     _run(body)
 
 
+def test_background_render_during_overlay_does_not_crash():
+    """Regression: a periodic refresh firing while a modal/command-palette is
+    open must not query through the overlay screen (NoMatches -> crash)."""
+    async def body():
+        with patch("hetzman.core.reads.get_fleet_status", return_value=_healthy_fleet()), \
+             patch("hetzman.core.reads.get_system_status", return_value=_system()):
+            app = HetzmanApp()
+            async with app.run_test() as pilot:
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                # open an overlay (the Add modal on the DNS tab)
+                app.push_add("tab-dns")
+                await pilot.pause()
+                assert app._overlay_active()
+                # a background refresh fires while the overlay is up
+                app._render_fleet(_healthy_fleet())
+                app._render_system(_system())
+                app._render_domains([], [], [], None)
+                await pilot.pause()
+                # app is still alive; the overlay is still the active screen
+                assert app.is_running
+                assert app._overlay_active()
+    _run(body)
+
+
 def test_refresh_action_reloads():
     async def body():
         with patch("hetzman.core.reads.get_fleet_status", return_value=_healthy_fleet()) as gf, \

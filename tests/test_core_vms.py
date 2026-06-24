@@ -82,6 +82,30 @@ class CreateVmTests(unittest.TestCase):
         steps = [e for e in events if e.severity == Severity.STEP]
         self.assertEqual(len(steps), 5)
 
+    def test_create_container_passes_type_through(self):
+        with self._patches() as m:
+            m["check_vm_exists"].return_value = False
+            m["get_settings"].return_value = mock.Mock(current_server="srv1")
+            m["_wait_private_ip"].return_value = "10.100.1.5"
+            m["secure_vm_instance"].return_value = True
+            m["sync_lock"].side_effect = lambda: _lock(True)
+            m["add_dns"].side_effect = _leaf()
+            events, result = _drain(
+                core_vms.create_vm("ct1", network_type="private", instance_type="container")
+            )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.summary["type"], "container")
+        # the type reached _incus_launch
+        _args, kwargs = m["_incus_launch"].call_args
+        passed = kwargs.get("instance_type", _args[-1] if _args else None)
+        self.assertEqual(passed, "container")
+
+    def test_create_rejects_bad_instance_type(self):
+        with self._patches() as m:
+            m["check_vm_exists"].return_value = False
+            with self.assertRaises(ValidationError):
+                _drain(core_vms.create_vm("x", instance_type="lxc"))
+
     def test_create_failure_rolls_back_ip_dns_and_instance(self):
         with self._patches() as m:
             m["check_vm_exists"].return_value = False
