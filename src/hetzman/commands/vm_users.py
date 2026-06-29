@@ -73,7 +73,10 @@ def vm_users_sudo(
     username: str = typer.Argument(..., help="Username"),
     revoke: bool = typer.Option(False, "--revoke", help="Revoke sudo instead of granting"),
 ):
-    """Grant (default) or --revoke passwordless sudo for a user on a VM."""
+    """Grant (default) or --revoke sudo for a user on a VM.
+
+    Grant adds a passwordless sudoers drop-in; --revoke removes it AND strips
+    sudo/admin/wheel group membership (fully de-sudos the user)."""
     drive(core_users.set_user_sudo("vm", vm_name, username, grant=not revoke))
 
 

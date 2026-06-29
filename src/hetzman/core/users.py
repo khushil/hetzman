@@ -362,7 +362,15 @@ def set_user_sudo(scope, target, username: str, grant: bool, *, host=None) -> Pr
         yield ProgressEvent(Severity.SUCCESS, f"granted sudo to '{username}'")
     else:
         yield ProgressEvent(Severity.INFO, f"Revoking sudo from '{username}' on {scope} {target}...")
+        # remove the hetzman drop-in AND strip group-based sudo, so revoke fully
+        # de-sudos a user (a sudo/admin/wheel member, not just a hetzman grant).
         _user_run(scope, target, ["rm", "-f", sudo_file], host=host)
-        yield ProgressEvent(Severity.SUCCESS, f"revoked sudo from '{username}'")
+        strip_groups = (
+            f"for g in sudo admin wheel; do "
+            f"gpasswd -d {username} $g 2>/dev/null || deluser {username} $g 2>/dev/null || true; "
+            f"done"
+        )
+        _user_run(scope, target, ["bash", "-c", strip_groups], host=host, check=False)
+        yield ProgressEvent(Severity.SUCCESS, f"revoked sudo from '{username}' (drop-in + groups)")
     return OpResult(ok=True, summary={"scope": scope, "target": target,
                                       "username": username, "sudo": grant})

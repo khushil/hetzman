@@ -70,6 +70,17 @@ class UserCrudTests(unittest.TestCase):
             _drain(core_users.set_user_sudo("vm", "v", "bob", True, host="node-a"))
         self.assertIn("visudo -cf", " ".join(seen["argv"]))
 
+    def test_revoke_sudo_removes_dropin_and_groups(self):
+        cmds = []
+        with mock.patch.object(core_users, "_user_exists", return_value=True), \
+             mock.patch.object(core_users, "_user_run",
+                               side_effect=lambda *a, **k: cmds.append(a[2]) or _Res()):
+            _drain(core_users.set_user_sudo("host", "h", "alice", False))
+        flat = " ".join(" ".join(c) for c in cmds)
+        self.assertIn("rm -f /etc/sudoers.d/90-hetzman-alice", flat)
+        self.assertIn("gpasswd -d alice", flat)        # group sudo stripped too
+        self.assertIn("sudo admin wheel", flat)
+
     def test_vm_scope_routes_incus_through_host(self):
         seen = {}
 
