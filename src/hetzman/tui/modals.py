@@ -12,7 +12,7 @@ from typing import Optional
 from textual.app import ComposeResult
 from textual.containers import Grid, Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Checkbox, Input, Label, Select
+from textual.widgets import Button, Checkbox, DataTable, Input, Label, Select
 
 
 class ConfirmModal(ModalScreen[bool]):
@@ -284,6 +284,78 @@ class TypedConfirmModal(ModalScreen[bool]):
 
     def action_cancel(self) -> None:
         self.dismiss(False)
+
+
+class ManageUsersModal(ModalScreen[Optional[dict]]):
+    """Full-CRUD user management for a VM or host. Lists accounts and dismisses
+    {"action": add|suspend|unsuspend|sudo_grant|sudo_revoke|remove, "username": <name>}
+    (username omitted for "add"), or None on close."""
+
+    DEFAULT_CSS = """
+    ManageUsersModal { align: center middle; }
+    ManageUsersModal > Vertical {
+        width: 96; height: auto; max-height: 90%; padding: 1 2;
+        border: thick $accent; background: $surface;
+    }
+    ManageUsersModal Label.title { text-style: bold; color: $accent; padding-bottom: 1; }
+    ManageUsersModal DataTable { height: auto; max-height: 16; }
+    ManageUsersModal Horizontal { height: auto; align: center middle; padding-top: 1; }
+    ManageUsersModal Button { margin: 0 1; }
+    """
+
+    BINDINGS = [("escape", "cancel", "Close")]
+
+    def __init__(self, scope: str, target: str, accounts) -> None:
+        super().__init__()
+        self._scope = scope
+        self._target = target
+        self._accounts = accounts
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label(f"Users on {self._scope} {self._target}  —  select a row, then act",
+                        classes="title")
+            yield DataTable(id="users", cursor_type="row", zebra_stripes=True)
+            with Horizontal():
+                yield Button("Add", variant="success", id="add")
+                yield Button("Suspend", id="suspend")
+                yield Button("Unsuspend", id="unsuspend")
+                yield Button("Grant sudo", id="sudo_grant")
+                yield Button("Revoke sudo", id="sudo_revoke")
+                yield Button("Remove", variant="error", id="remove")
+                yield Button("Close", id="cancel")
+
+    def on_mount(self) -> None:
+        table = self.query_one("#users", DataTable)
+        table.add_columns("User", "UID", "Sudo", "Status", "Keys")
+        for a in self._accounts:
+            table.add_row(
+                a.name, "-" if a.uid is None else str(a.uid),
+                "yes" if a.sudo else "-",
+                "SUSPENDED" if a.locked else "active", str(a.key_count),
+            )
+
+    def _selected_user(self) -> Optional[str]:
+        table = self.query_one("#users", DataTable)
+        if table.row_count == 0 or table.cursor_row is None:
+            return None
+        return str(table.get_row_at(table.cursor_row)[0])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id
+        if bid == "cancel":
+            self.dismiss(None)
+            return
+        if bid == "add":
+            self.dismiss({"action": "add"})
+            return
+        user = self._selected_user()
+        if user is None:
+            return
+        self.dismiss({"action": bid, "username": user})
 
 
 class AddUserModal(_FormModal):

@@ -45,6 +45,7 @@ from .modals import (
     AddUserModal,
     ConfirmModal,
     DnsAddModal,
+    ManageUsersModal,
     HostPickerModal,
     InstanceChangeModal,
     InstanceNameModal,
@@ -88,6 +89,8 @@ class HetzmanCommands(Provider):
             ("Add port forward", lambda: app.push_add("tab-ports")),
             ("Change instance (cpu/mem/disk)", app.action_change_instance),
             ("Reboot instance", app.action_reboot_instance),
+            ("Manage users — list/add/suspend/sudo/remove (selected VM or host)",
+             app.action_manage_users),
             ("Add user (selected VM or host)", app.action_add_user),
             ("Apply updates on a host", app.action_apply_updates),
             ("Reboot a host", app.action_reboot_host),
@@ -141,7 +144,7 @@ class HetzmanApp(App):
         ("a", "add", "Add"),
         ("c", "change_instance", "Change"),
         ("b", "reboot_instance", "Reboot"),
-        ("u", "add_user", "Add user"),
+        ("u", "manage_users", "Users"),
         ("d", "delete", "Delete"),
         ("ctrl+p", "command_palette", "All actions"),
         ("q", "quit", "Quit"),
@@ -309,6 +312,85 @@ class HetzmanApp(App):
         else:
             self.query_one(LogPanel).info(
                 "Add user: select an instance (Instances tab) or a host (Nodes tab) first.")
+
+    def action_manage_users(self) -> None:
+        """Open full-CRUD user management for the selected VM (Instances) or host
+        (Nodes): list + add/suspend/unsuspend/sudo/remove."""
+        tab = self._active_tab
+        if tab == "tab-instances":
+            row = self._selected("#instance-table")
+            if not row:
+                self.query_one(LogPanel).info("Select an instance row first (Instances tab).")
+                return
+            self._load_users_and_open("vm", row[0], row[1])
+        elif tab == "tab-nodes":
+            row = self._selected("#node-table")
+            if not row:
+                self.query_one(LogPanel).info("Select a node row first (Nodes tab).")
+                return
+            self._load_users_and_open("host", row[0], row[0])
+        else:
+            self.query_one(LogPanel).info(
+                "Manage users: select an instance (Instances tab) or a host (Nodes tab) first.")
+
+    @work(thread=True, group="users", exclusive=True)
+    def _load_users_and_open(self, scope: str, target: str, host: str) -> None:
+        try:
+            accounts = core_users.list_users(scope, target, host=(host if scope == "vm" else None))
+        except Exception as exc:  # noqa: BLE001 - surface, never crash
+            self.call_from_thread(
+                self.query_one(LogPanel).error, f"list users: {type(exc).__name__}: {exc}")
+            return
+        self.call_from_thread(self._open_users_modal, scope, target, host, accounts)
+
+    def _open_users_modal(self, scope, target, host, accounts) -> None:
+        self.push_screen(
+            ManageUsersModal(scope, target, accounts),
+            lambda data: self._on_manage_users(scope, target, host, data),
+        )
+
+    def _on_manage_users(self, scope, target, host, data) -> None:
+        if not data:
+            return
+        action = data["action"]
+        if action == "add":
+            self.push_screen(AddUserModal(scope, target, host), self._on_add_user)
+            return
+        user = data["username"]
+        vm_host = host if scope == "vm" else None
+        if action == "unsuspend":
+            self._run_mutation(
+                lambda: core_users.unsuspend_user(scope, target, user, host=vm_host),
+                f"unsuspend {user}@{target}")
+        elif action == "sudo_grant":
+            self._run_mutation(
+                lambda: core_users.set_user_sudo(scope, target, user, True, host=vm_host),
+                f"grant sudo {user}@{target}")
+        elif action == "sudo_revoke":
+            self._run_mutation(
+                lambda: core_users.set_user_sudo(scope, target, user, False, host=vm_host),
+                f"revoke sudo {user}@{target}")
+        elif action == "suspend":
+            self._confirm(
+                f"Suspend {user} on {scope} {target}? Blocks ALL login (incl. SSH keys).",
+                lambda: core_users.suspend_user(scope, target, user, host=vm_host),
+                f"suspend {user}@{target}")
+        elif action == "remove":
+            def _confirmed(ok):
+                if not ok:
+                    return
+                if scope == "host":
+                    self._run_mutation(
+                        lambda: core_users.remove_host_user(target, user),
+                        f"remove {user}@host {target}")
+                else:
+                    self._delegate(
+                        host, ["vm", "users", "remove", target, user, "--yes"],
+                        lambda: core_users.remove_user(target, user),
+                        f"remove {user}@{target}")
+            self.push_screen(
+                TypedConfirmModal(f"Remove user {user} + home dir from {scope} {target}", user),
+                _confirmed)
 
     def _on_add_user(self, data) -> None:
         if not data:

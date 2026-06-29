@@ -245,3 +245,124 @@ def change_host_keys(host: str, username: str, key_file: str) -> ProgressGen:
         )
     yield ProgressEvent(Severity.SUCCESS, f"changed keys for '{username}' on host {host}")
     return OpResult(ok=True, summary={"host": host, "username": username})
+
+
+# --------------------------------------------------------------------------- #
+# Unified CRUD + lifecycle for users on EITHER a VM or a host.
+#   scope = "vm"   -> runs via `incus exec` on the local node
+#   scope = "host" -> runs via the host executor (local or SSH)
+# --------------------------------------------------------------------------- #
+from .models import UserAccount  # noqa: E402  (kept local to this section)
+
+# Accounts hetzman must never lock out or delete (would sever fleet access).
+PROTECTED_USERS = frozenset({"root"})
+
+
+def _user_run(scope, target, argv, *, host=None, check=True, input=None, timeout=30):
+    """Run a command on a host or inside a VM, routed through the executor so it
+    works whether the target is local or remote.
+
+    * scope="host": run ``argv`` on host ``target``.
+    * scope="vm":   run ``incus exec target -- argv`` on the VM's node ``host``
+      (``host=None`` => the local node)."""
+    if scope == "host":
+        return host_exec.run_on(target, argv, root=True, check=check, input=input, timeout=timeout)
+    if scope == "vm":
+        return host_exec.run_on(host, ["incus", "exec", target, "--", *argv],
+                                root=True, check=check, input=input, timeout=timeout)
+    raise ValidationError(f"scope must be 'vm' or 'host', got {scope!r}")
+
+
+def _user_exists(scope, target, username, *, host=None) -> bool:
+    return _user_run(scope, target, ["id", username], host=host, check=False).returncode == 0
+
+
+# Suspended == account EXPIRED (shadow field 8 set and in the past). A locked
+# password (passwd -S => 'L') is the NORMAL state for key-only accounts, so it is
+# NOT a suspension signal — only the expiry is.
+_LIST_USERS_PROBE = r"""
+today=$(( $(date +%s) / 86400 ))
+for u in $(getent passwd | awk -F: '($3>=1000 && $3<65534){print $1}'; echo root); do
+  home=$(getent passwd "$u" | cut -d: -f6)
+  exp=$(getent shadow "$u" 2>/dev/null | cut -d: -f8)
+  susp=no
+  if [ -n "$exp" ] && [ "$exp" != "-1" ] && [ "$exp" -le "$today" ] 2>/dev/null; then susp=yes; fi
+  sudo=no
+  [ -f "/etc/sudoers.d/90-hetzman-$u" ] && sudo=yes
+  id -nG "$u" 2>/dev/null | grep -qwE 'sudo|admin|wheel' && sudo=yes
+  kc=$(grep -c . "$home/.ssh/authorized_keys" 2>/dev/null || echo 0)
+  echo "$u|$(id -u "$u" 2>/dev/null)|$susp|$sudo|$kc|$home"
+done
+"""
+
+
+def list_users(scope, target, *, host=None) -> list:
+    """List login accounts (uid>=1000 plus root) on a VM or host. One probe."""
+    res = _user_run(scope, target, ["bash", "-c", _LIST_USERS_PROBE],
+                    host=host, check=False, timeout=30)
+    accounts: list[UserAccount] = []
+    seen = set()
+    for line in (res.stdout or "").splitlines():
+        parts = line.split("|")
+        if len(parts) != 6:
+            continue
+        name, uid, susp, sudo, kc, home = parts
+        if name in seen:
+            continue
+        seen.add(name)
+        try:
+            uidn = int(uid)
+        except ValueError:
+            uidn = None
+        accounts.append(UserAccount(
+            name=name, uid=uidn, sudo=(sudo == "yes"),
+            locked=(susp == "yes"), key_count=int(kc) if kc.isdigit() else 0,
+            home=home or None,
+        ))
+    return sorted(accounts, key=lambda a: (a.uid or 0))
+
+
+def suspend_user(scope, target, username: str, *, host=None) -> ProgressGen:
+    """Suspend (lock + expire) an account so NO login works — not even key auth."""
+    if username in PROTECTED_USERS:
+        raise ValidationError(f"refusing to suspend protected user '{username}'")
+    if not _user_exists(scope, target, username, host=host):
+        raise NotFoundError(f"user '{username}' not found on {scope} {target}")
+    yield ProgressEvent(Severity.INFO, f"Suspending '{username}' on {scope} {target}...")
+    # lock the password AND expire the account (the latter blocks key-based SSH too)
+    _user_run(scope, target, ["usermod", "--lock", "--expiredate", "1", username], host=host)
+    yield ProgressEvent(Severity.SUCCESS, f"suspended '{username}' on {scope} {target}")
+    return OpResult(ok=True, summary={"scope": scope, "target": target, "username": username})
+
+
+def unsuspend_user(scope, target, username: str, *, host=None) -> ProgressGen:
+    """Re-enable a suspended account (unlock + clear the expiry)."""
+    if not _user_exists(scope, target, username, host=host):
+        raise NotFoundError(f"user '{username}' not found on {scope} {target}")
+    yield ProgressEvent(Severity.INFO, f"Re-enabling '{username}' on {scope} {target}...")
+    _user_run(scope, target, ["usermod", "--unlock", "--expiredate", "", username], host=host)
+    yield ProgressEvent(Severity.SUCCESS, f"re-enabled '{username}' on {scope} {target}")
+    return OpResult(ok=True, summary={"scope": scope, "target": target, "username": username})
+
+
+def set_user_sudo(scope, target, username: str, grant: bool, *, host=None) -> ProgressGen:
+    """Grant or revoke passwordless sudo via a hetzman-managed sudoers drop-in."""
+    if username in PROTECTED_USERS:
+        raise ValidationError(f"refusing to change sudo for protected user '{username}'")
+    if not _user_exists(scope, target, username, host=host):
+        raise NotFoundError(f"user '{username}' not found on {scope} {target}")
+    sudo_file = f"/etc/sudoers.d/90-hetzman-{username}"
+    if grant:
+        yield ProgressEvent(Severity.INFO, f"Granting sudo to '{username}' on {scope} {target}...")
+        rule = f"{username} ALL=(ALL) NOPASSWD: ALL"
+        # validate the drop-in before installing it (a bad sudoers file breaks sudo)
+        _user_run(scope, target, ["bash", "-c",
+                  f"echo {rule!r} > {sudo_file} && chmod 440 {sudo_file} && visudo -cf {sudo_file}"],
+                  host=host)
+        yield ProgressEvent(Severity.SUCCESS, f"granted sudo to '{username}'")
+    else:
+        yield ProgressEvent(Severity.INFO, f"Revoking sudo from '{username}' on {scope} {target}...")
+        _user_run(scope, target, ["rm", "-f", sudo_file], host=host)
+        yield ProgressEvent(Severity.SUCCESS, f"revoked sudo from '{username}'")
+    return OpResult(ok=True, summary={"scope": scope, "target": target,
+                                      "username": username, "sudo": grant})

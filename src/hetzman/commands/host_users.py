@@ -31,13 +31,51 @@ def host_users_add(
     drive(core_users.add_host_user(host, username, key, sudo=sudo))
 
 
+@host_users_app.command("list")
+def host_users_list(
+    host: str = typer.Argument(..., help="Fleet host name"),
+):
+    """List login accounts on a host (uid + sudo + suspended status + key count)."""
+    from ._users_render import render_users
+    render_users("host", host, core_users.list_users("host", host))
+
+
+@host_users_app.command("suspend")
+def host_users_suspend(
+    host: str = typer.Argument(..., help="Fleet host name"),
+    username: str = typer.Argument(..., help="Username to suspend"),
+):
+    """Suspend an account on a host (locks + expires it; blocks all login incl. keys)."""
+    drive(core_users.suspend_user("host", host, username))
+
+
+@host_users_app.command("unsuspend")
+def host_users_unsuspend(
+    host: str = typer.Argument(..., help="Fleet host name"),
+    username: str = typer.Argument(..., help="Username to re-enable"),
+):
+    """Re-enable a suspended account on a host."""
+    drive(core_users.unsuspend_user("host", host, username))
+
+
+@host_users_app.command("sudo")
+def host_users_sudo(
+    host: str = typer.Argument(..., help="Fleet host name"),
+    username: str = typer.Argument(..., help="Username"),
+    revoke: bool = typer.Option(False, "--revoke", help="Revoke sudo instead of granting"),
+):
+    """Grant (default) or --revoke passwordless sudo for a user on a host."""
+    drive(core_users.set_user_sudo("host", host, username, grant=not revoke))
+
+
 @host_users_app.command("remove")
 def host_users_remove(
     host: str = typer.Argument(..., help="Fleet host name"),
     username: str = typer.Argument(..., help="Username to remove"),
+    yes: bool = typer.Option(False, "--yes", help="Skip the confirmation prompt"),
 ):
     """Remove a user (and home dir) from a fleet host."""
-    if not typer.confirm(f"Remove user '{username}' and home dir from host {host}?"):
+    if not yes and not typer.confirm(f"Remove user '{username}' and home dir from host {host}?"):
         console.print("[red]Cancelled.[/red]")
         raise typer.Exit(code=1)
     drive(core_users.remove_host_user(host, username))

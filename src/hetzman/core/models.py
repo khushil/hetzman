@@ -380,6 +380,22 @@ class UpdateStatus:
 
 
 @dataclass(frozen=True)
+class UserAccount:
+    """A login account on a VM or host (uid>=1000 plus root).
+
+    Source: a batched probe (getent/passwd -S/sudoers/authorized_keys). ``locked``
+    means the account is suspended (password + login disabled); ``sudo`` reflects a
+    hetzman-managed passwordless-sudo drop-in."""
+
+    name: str
+    uid: int | None
+    sudo: bool
+    locked: bool
+    key_count: int
+    home: str | None
+
+
+@dataclass(frozen=True)
 class DnsServerStatus:
     """Live serving state of a node's managed dnsmasq (DNS + DHCP).
 

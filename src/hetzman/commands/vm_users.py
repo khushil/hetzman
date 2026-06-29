@@ -40,13 +40,51 @@ def vm_users_add(
     drive(core_users.add_user(vm_name, username, key, sudo=sudo))
 
 
+@users_app.command("list")
+def vm_users_list(
+    vm_name: str = typer.Argument(..., help="Name of the VM"),
+):
+    """List login accounts on a VM (uid + sudo + suspended status + key count)."""
+    from ._users_render import render_users
+    render_users("vm", vm_name, core_users.list_users("vm", vm_name))
+
+
+@users_app.command("suspend")
+def vm_users_suspend(
+    vm_name: str = typer.Argument(..., help="Name of the VM"),
+    username: str = typer.Argument(..., help="Username to suspend"),
+):
+    """Suspend an account on a VM (locks + expires it; blocks all login)."""
+    drive(core_users.suspend_user("vm", vm_name, username))
+
+
+@users_app.command("unsuspend")
+def vm_users_unsuspend(
+    vm_name: str = typer.Argument(..., help="Name of the VM"),
+    username: str = typer.Argument(..., help="Username to re-enable"),
+):
+    """Re-enable a suspended account on a VM."""
+    drive(core_users.unsuspend_user("vm", vm_name, username))
+
+
+@users_app.command("sudo")
+def vm_users_sudo(
+    vm_name: str = typer.Argument(..., help="Name of the VM"),
+    username: str = typer.Argument(..., help="Username"),
+    revoke: bool = typer.Option(False, "--revoke", help="Revoke sudo instead of granting"),
+):
+    """Grant (default) or --revoke passwordless sudo for a user on a VM."""
+    drive(core_users.set_user_sudo("vm", vm_name, username, grant=not revoke))
+
+
 @users_app.command("remove")
 def vm_users_remove(
     vm_name: str = typer.Argument(..., help="Name of the VM"),
     username: str = typer.Argument(..., help="Username to remove"),
+    yes: bool = typer.Option(False, "--yes", help="Skip the confirmation prompt"),
 ):
     """Remove a user and their home directory from a VM."""
-    if not typer.confirm(
+    if not yes and not typer.confirm(
         f"Are you sure you want to remove user '{username}' and their home directory from {vm_name}?"
     ):
         console.print("[red]Remove cancelled.[/red]")

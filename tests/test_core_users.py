@@ -16,6 +16,72 @@ def _drain(gen):
         return events, stop.value
 
 
+class _Res:
+    def __init__(self, stdout="", returncode=0):
+        self.stdout = stdout
+        self.returncode = returncode
+        self.stderr = ""
+
+
+class UserCrudTests(unittest.TestCase):
+    PROBE = (
+        "root|0|no|no|7|/root\n"
+        "kdep|1000|no|yes|7|/home/kdep\n"
+        "alice|1001|yes|no|1|/home/alice\n"        # suspended + sudo
+    )
+
+    def test_list_users_parses_probe(self):
+        with mock.patch.object(core_users, "_user_run", return_value=_Res(self.PROBE)):
+            accounts = core_users.list_users("host", "h")
+        by = {a.name: a for a in accounts}
+        self.assertFalse(by["kdep"].locked)
+        self.assertTrue(by["kdep"].sudo)
+        self.assertTrue(by["alice"].locked)        # susp == "yes"
+        self.assertEqual(by["alice"].key_count, 1)
+        self.assertEqual(by["root"].uid, 0)
+
+    def test_suspend_refuses_root(self):
+        with self.assertRaises(ValidationError):
+            _drain(core_users.suspend_user("host", "h", "root"))
+
+    def test_set_sudo_refuses_root(self):
+        with self.assertRaises(ValidationError):
+            _drain(core_users.set_user_sudo("host", "h", "root", True))
+
+    def test_suspend_locks_and_expires(self):
+        calls = []
+        with mock.patch.object(core_users, "_user_exists", return_value=True), \
+             mock.patch.object(core_users, "_user_run",
+                               side_effect=lambda *a, **k: calls.append(a[2]) or _Res()):
+            events, result = _drain(core_users.suspend_user("host", "h", "alice"))
+        self.assertTrue(result.ok)
+        self.assertIn(["usermod", "--lock", "--expiredate", "1", "alice"], calls)
+
+    def test_suspend_missing_user_raises(self):
+        with mock.patch.object(core_users, "_user_exists", return_value=False):
+            with self.assertRaises(NotFoundError):
+                _drain(core_users.suspend_user("vm", "v", "ghost", host="node-a"))
+
+    def test_grant_sudo_validates_with_visudo(self):
+        seen = {}
+        with mock.patch.object(core_users, "_user_exists", return_value=True), \
+             mock.patch.object(core_users, "_user_run",
+                               side_effect=lambda *a, **k: seen.update(argv=a[2]) or _Res()):
+            _drain(core_users.set_user_sudo("vm", "v", "bob", True, host="node-a"))
+        self.assertIn("visudo -cf", " ".join(seen["argv"]))
+
+    def test_vm_scope_routes_incus_through_host(self):
+        seen = {}
+
+        def fake_run_on(host, argv, **kw):
+            seen.update(host=host, argv=list(argv))
+            return _Res()
+        with mock.patch("hetzman.core.users.host_exec.run_on", side_effect=fake_run_on):
+            core_users._user_run("vm", "myvm", ["id", "bob"], host="node-b", check=False)
+        self.assertEqual(seen["host"], "node-b")
+        self.assertEqual(seen["argv"][:4], ["incus", "exec", "myvm", "--"])
+
+
 class AddUserTests(unittest.TestCase):
     @mock.patch("hetzman.core.users._push_key")
     @mock.patch("hetzman.core.users.run_vm_exec", return_value=True)

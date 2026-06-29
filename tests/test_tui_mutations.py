@@ -251,6 +251,67 @@ def test_add_user_host_scope_runs_add_host_user():
     _run(body)
 
 
+def test_manage_users_sudo_grant_dispatches():
+    async def body():
+        patches = _reads_patch()
+        for p in patches:
+            p.start()
+        seen = {}
+
+        def fake_sudo(scope, target, user, grant, *, host=None):
+            seen.update(scope=scope, target=target, user=user, grant=grant, host=host)
+            yield ProgressEvent(Severity.SUCCESS, "ok")
+            return OpResult(ok=True, summary={})
+
+        try:
+            with patch("hetzman.tui.app.core_users.set_user_sudo", side_effect=fake_sudo):
+                app = HetzmanApp()
+                async with app.run_test() as pilot:
+                    await app.workers.wait_for_complete()
+                    app._on_manage_users("vm", "web1", "node-a",
+                                         {"action": "sudo_grant", "username": "bob"})
+                    await app.workers.wait_for_complete()
+                    await pilot.pause()
+            assert seen == {"scope": "vm", "target": "web1", "user": "bob",
+                            "grant": True, "host": "node-a"}
+        finally:
+            for p in patches:
+                p.stop()
+    _run(body)
+
+
+def test_manage_users_suspend_requires_confirm():
+    async def body():
+        patches = _reads_patch()
+        for p in patches:
+            p.start()
+        called = {"n": 0}
+
+        def fake_suspend(*a, **k):
+            called["n"] += 1
+            yield ProgressEvent(Severity.SUCCESS, "ok")
+            return OpResult(ok=True, summary={})
+
+        try:
+            with patch("hetzman.tui.app.core_users.suspend_user", side_effect=fake_suspend):
+                app = HetzmanApp()
+                async with app.run_test() as pilot:
+                    await app.workers.wait_for_complete()
+                    app._on_manage_users("host", "htz-a", "htz-a",
+                                         {"action": "suspend", "username": "bob"})
+                    await pilot.pause()
+                    # a confirmation gate must appear; suspend not yet run
+                    assert isinstance(app.screen, ConfirmModal)
+                    await pilot.press("escape")
+                    await app.workers.wait_for_complete()
+                    await pilot.pause()
+                    assert called["n"] == 0
+        finally:
+            for p in patches:
+                p.stop()
+    _run(body)
+
+
 def test_command_palette_provider_lists_actions():
     async def body():
         patches = _reads_patch()
