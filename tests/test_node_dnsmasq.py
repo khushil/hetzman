@@ -160,6 +160,92 @@ def test_serving_fails_when_dhcp_listener_gone():
 
 
 # --------------------------------------------------------------------------
+# leasefile check — differential, so a node with no instances isn't "dead"
+
+def _healthy_run(cmd, timeout=30):
+    """A fleet-healthy responder: dnsmasq restarts cleanly, resolves both ways,
+    and holds the DHCP :67 listener."""
+    if cmd[:2] == ["dig", "+short"] and "-x" in cmd:
+        return _ok(stdout="htz-hel1-dc12-bm-01.daemondreams.home.arpa.\n")
+    if cmd[:2] == ["dig", "+short"]:
+        return _ok(stdout="10.0.0.4\n")
+    if cmd[0] == "ss":
+        return _ok(stdout='UNCONN 0 0 0.0.0.0:67 ... users:(("dnsmasq",pid=1))')
+    return _ok()
+
+
+def test_serving_ok_with_no_leases_when_check_not_armed():
+    """A never-leased node still passes: DHCP liveness comes from the :67
+    listener, not from lease history."""
+    with patch.object(node, "_systemctl_active", return_value=True), \
+         patch.object(node, "_run", side_effect=_healthy_run), \
+         patch.object(node, "_leasefile_size", return_value=-1):
+        ok, reason = node._dnsmasq_serving(
+            _node(), check_dhcp=True, require_leases=False)
+    assert ok and reason == "ok"
+
+
+def test_serving_still_fails_when_leases_disappear_and_check_armed():
+    """The regression the leasefile check exists for must still be caught."""
+    with patch.object(node, "_systemctl_active", return_value=True), \
+         patch.object(node, "_run", side_effect=_healthy_run), \
+         patch.object(node, "_leasefile_size", return_value=0), \
+         patch.object(node, "time", SimpleNamespace(sleep=lambda *_: None)):
+        ok, reason = node._dnsmasq_serving(
+            _node(), check_dhcp=True, require_leases=True)
+    assert not ok and reason == "leasefile empty"
+
+
+def test_apply_on_fresh_node_with_no_leases_does_not_roll_back():
+    """Bootstrap regression: a new node has no instances, so no leases. That must
+    not roll the conf back and escalate to CRITICAL + the down-sentinel, which
+    would leave node-sync erroring on every run forever."""
+    restarts = []
+
+    def fake_run(cmd, timeout=30):
+        if cmd[:3] == ["systemctl", "restart", "dnsmasq"]:
+            restarts.append(cmd)
+            return _ok()
+        return _healthy_run(cmd, timeout)
+
+    with patch.object(node, "_run", side_effect=fake_run), \
+         patch.object(node, "_write") as wr, \
+         patch.object(node, "_systemctl_active", return_value=True), \
+         patch.object(node, "_leasefile_size", return_value=-1), \
+         patch.object(node, "log_message") as logm, \
+         patch.object(node, "_clear_dnsmasq_sentinel") as clear, \
+         patch("os.path.exists", return_value=True), \
+         patch("shutil.copy2"), patch("os.unlink"):
+        changed, errors = node._apply_dnsmasq(
+            _node(), include_drift=False, desired_include="",
+            conf_drift=True, conf_is_managed=True, desired_conf="# Managed\nx\n")
+
+    assert errors == []
+    assert "dnsmasq.conf" in changed
+    assert len(restarts) == 1        # applied once; never rolled back
+    logm.assert_not_called()         # no CRITICAL escalation
+    clear.assert_called_once()
+    assert not any(c.args[0] == node.DNSMASQ_DOWN_SENTINEL for c in wr.call_args_list)
+
+
+def test_apply_arms_lease_check_only_when_leases_existed_before():
+    """The baseline is sampled before the apply and threaded into both the
+    post-apply and the post-rollback check."""
+    for size, expected in ((521, True), (0, False), (-1, False)):
+        with patch.object(node, "_run", return_value=_ok()), \
+             patch.object(node, "_write"), \
+             patch.object(node, "_leasefile_size", return_value=size), \
+             patch.object(node, "_dnsmasq_serving", return_value=(True, "ok")) as serving, \
+             patch.object(node, "_clear_dnsmasq_sentinel"), \
+             patch("os.path.exists", return_value=True), \
+             patch("shutil.copy2"), patch("os.unlink"):
+            node._apply_dnsmasq(
+                _node(), include_drift=False, desired_include="",
+                conf_drift=True, conf_is_managed=True, desired_conf="# Managed\nx\n")
+        assert serving.call_args.kwargs["require_leases"] is expected, size
+
+
+# --------------------------------------------------------------------------
 # _trusted_dns_clients — fail-closed
 
 def test_trusted_clients_default_is_vswitch_only():

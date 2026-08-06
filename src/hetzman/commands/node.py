@@ -42,6 +42,7 @@ from ..registry import (
 from ..render import (
     DNS_LEASEFILE,
     MANAGED_HEADER,
+    NAT_CUSTOM_CHAINS,
     RenderError,
     TRUSTED_DNS_CLIENTS,
     base_ensure_rules,
@@ -150,10 +151,30 @@ def _systemctl_active(unit: str) -> bool:
     return (_run(["systemctl", "is-active", unit], timeout=10).stdout or "").strip() == "active"
 
 
-def _dnsmasq_serving(self_node: dict, *, check_dhcp: bool) -> Tuple[bool, str]:
+def _leasefile_size() -> int:
+    """Bytes in the DHCP leasefile; -1 when it does not exist."""
+    try:
+        return os.path.getsize(DNS_LEASEFILE)
+    except OSError:
+        return -1
+
+
+def _dnsmasq_serving(
+    self_node: dict, *, check_dhcp: bool, require_leases: bool = True
+) -> Tuple[bool, str]:
     """Poll up to ~8s (> dnsmasq.service RestartSec=5) for dnsmasq to be fully
     serving. Returns (ok, reason). ``--test`` + a forward dig can both pass while
-    DHCP is dead, so we additionally check the :67 listener and the leasefile."""
+    DHCP is dead, so we additionally check the :67 listener and the leasefile.
+
+    ``require_leases`` makes the leasefile check *differential*: the caller
+    passes whether leases existed BEFORE the apply. A node that has never handed
+    out a lease — a freshly bootstrapped one with no instances yet, or any node
+    whose last instance was removed — legitimately has an empty leasefile, and
+    treating that as failure would roll back a perfectly good conf and then
+    escalate (the rollback is equally lease-less), leaving node-sync permanently
+    erroring. The :67 listener check still runs either way, so DHCP liveness is
+    verified on a fresh node too; only the "we lost the leases we had" signal is
+    conditional."""
     last = "unknown"
     for _ in range(8):
         if not _systemctl_active("dnsmasq"):
@@ -178,15 +199,16 @@ def _dnsmasq_serving(self_node: dict, *, check_dhcp: bool) -> Tuple[bool, str]:
                 last = "DHCP :67 listener gone"
                 time.sleep(1)
                 continue
-            try:
-                if os.path.getsize(DNS_LEASEFILE) <= 0:
+            if require_leases:
+                size = _leasefile_size()
+                if size < 0:
+                    last = "leasefile missing"
+                    time.sleep(1)
+                    continue
+                if size == 0:
                     last = "leasefile empty"
                     time.sleep(1)
                     continue
-            except OSError:
-                last = "leasefile missing"
-                time.sleep(1)
-                continue
         return True, "ok"
     return False, last
 
@@ -234,11 +256,15 @@ def _apply_dnsmasq(
     * a ``.rollback`` snapshot is taken every apply and restored on ANY failed
       post-apply check (active + forward + reverse + DHCP :67 + leasefile);
     * if even the rollback isn't serving, escalate (CRITICAL log + a
-      ``dnsmasq-down`` sentinel) instead of leaving DHCP silently dead.
+      ``dnsmasq-down`` sentinel) instead of leaving DHCP silently dead;
+    * the leasefile arm of that check is only armed when leases existed BEFORE
+      the apply, so a node with no instances yet is not mistaken for a dead one.
     """
     changed: List[str] = []
     errors: List[str] = []
     needs_restart = False
+    # Sampled before anything is written: "did this node have leases to lose?"
+    had_leases = _leasefile_size() > 0
 
     if include_drift:
         try:
@@ -282,7 +308,7 @@ def _apply_dnsmasq(
         return changed, errors
 
     _run(["systemctl", "restart", "dnsmasq"])
-    ok, reason = _dnsmasq_serving(self_node, check_dhcp=True)
+    ok, reason = _dnsmasq_serving(self_node, check_dhcp=True, require_leases=had_leases)
     if ok:
         _clear_dnsmasq_sentinel()
         return changed, errors
@@ -296,7 +322,7 @@ def _apply_dnsmasq(
         except OSError as e:
             errors.append(f"dnsmasq.conf rollback copy failed: {e}")
     _run(["systemctl", "restart", "dnsmasq"])
-    ok2, reason2 = _dnsmasq_serving(self_node, check_dhcp=True)
+    ok2, reason2 = _dnsmasq_serving(self_node, check_dhcp=True, require_leases=had_leases)
     if ok2:
         _clear_dnsmasq_sentinel()
         return changed, errors
@@ -552,6 +578,27 @@ def _iptables_live_missing(
     return missing
 
 
+def _ensure_nat_chains() -> None:
+    """Create the custom nat chains if they do not exist yet.
+
+    The base ruleset jumps PREROUTING/POSTROUTING into HETZMAN_NAT and
+    HETZMAN_NAT_POST. On a freshly provisioned node neither chain exists, so the
+    live-ensure step below fails every one of those jumps with
+    ``Chain 'HETZMAN_NAT' does not exist``. ``do_sync_apply`` does create them —
+    but it runs at the END of node-sync, so the FIRST run on any new node always
+    reported errors and only the second run came back clean.
+
+    Creating a chain that already exists is an error we deliberately ignore;
+    this is idempotent and additive, and never touches rules.
+    """
+    for chain in NAT_CUSTOM_CHAINS:
+        exists = _run(
+            ["iptables", "-w", "5", "-t", "nat", "-L", chain, "-n"], timeout=10
+        ).returncode == 0
+        if not exists:
+            _run(["iptables", "-w", "5", "-t", "nat", "-N", chain], timeout=10)
+
+
 def _systemd_changes() -> List[str]:
     changed = []
     for data_name, (dest, _mode) in DATA_INSTALL_MAP.items():
@@ -561,8 +608,17 @@ def _systemd_changes() -> List[str]:
 
 
 def _post_check_network(self_node: dict, nodes: Dict[str, dict]) -> bool:
+    """Did the netplan apply leave this node able to talk to the fleet?
+
+    The peer-ping arm is only meaningful when there IS a peer. On a single-node
+    fleet ``peers`` is empty and ``any([])`` is False, which would fail every
+    netplan apply, roll it straight back, and leave node-sync reporting an error
+    on every run forever — with the drift never clearing. So require a peer to
+    answer only when one exists; etcd reachability is the arm that still means
+    something either way.
+    """
     peers = [n["vswitch_ip"] for name, n in sorted(nodes.items()) if name != self_node["name"]]
-    ping_ok = any(
+    ping_ok = not peers or any(
         _run(["ping", "-c1", "-W2", ip], timeout=10).returncode == 0 for ip in peers[:2]
     )
     from ..etcd_kv import get_key
@@ -734,6 +790,7 @@ def _node_sync_run(apply: bool) -> int:
                 _run(["netplan", "apply"], timeout=60)
 
     # iptables: live ensure first (additive), then deletions, then base files.
+    _ensure_nat_chains()
     for table, _chain, _args in base_policies():
         _run(["iptables", "-w", "5", "-t", table, "-P", _chain, _args], timeout=10)
     for table, chain, args in live_missing:

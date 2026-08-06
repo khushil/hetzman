@@ -10,7 +10,12 @@ from unittest import mock
 
 from hetzman.core import nodes
 from hetzman.core.errors import CoreError, NotFoundError, ValidationError
-from hetzman.core.nodes import MemberView, assess_removal, map_to_member
+from hetzman.core.nodes import (
+    MemberView,
+    assess_addition,
+    assess_removal,
+    map_to_member,
+)
 
 
 def _mv(id, name="m", healthy=True, leader=False, peer="10.0.0.1"):
@@ -24,6 +29,50 @@ def _drain(gen):
             events.append(next(gen))
     except StopIteration as stop:
         return events, stop.value
+
+
+class AssessAdditionTests(unittest.TestCase):
+    """Growing the cluster raises quorum immediately while the newcomer is not
+    yet healthy, so the margin must come from the existing members."""
+
+    def test_empty_membership_refused(self):
+        with self.assertRaises(CoreError):
+            assess_addition([])
+
+    def test_unstarted_member_refused(self):
+        # A joining/unstarted member means the topology is mid-transition.
+        members = [_mv(1, "a"), _mv(2, "b"), _mv(3, ""), _mv(4, "d")]
+        with self.assertRaises(CoreError):
+            assess_addition(members)
+
+    def test_n4_to_5_requires_all_four_healthy(self):
+        # 4->5: quorum after is 3. All 4 healthy -> margin 1 -> safe.
+        members = [_mv(1, "a"), _mv(2, "b"), _mv(3, "c"), _mv(4, "d", leader=True)]
+        assess_addition(members)
+
+    def test_n4_to_5_refused_at_three_healthy(self):
+        # The case a bare quorum check would wrongly allow: 3 healthy of 4 IS a
+        # quorum, but the resulting 5-member cluster has quorum 3 and exactly 3
+        # healthy — zero margin, one more fault stops writes.
+        members = [_mv(1, "a"), _mv(2, "b"), _mv(3, "c", healthy=False), _mv(4, "d")]
+        with self.assertRaises(CoreError) as ctx:
+            assess_addition(members)
+        self.assertIn("margin", str(ctx.exception))
+
+    def test_n3_to_4_requires_all_three_healthy(self):
+        # 3->4: quorum after is 3, so all 3 healthy gives zero margin -> refused.
+        members = [_mv(1, "a"), _mv(2, "b"), _mv(3, "c")]
+        with self.assertRaises(CoreError):
+            assess_addition(members)
+
+    def test_n5_to_6_allows_one_unhealthy(self):
+        # 5->6: quorum after is 4, so 5 healthy gives margin 1 -> safe.
+        members = [_mv(i, f"m{i}") for i in range(1, 6)]
+        assess_addition(members)
+        # ...but 4 healthy of 5 lands exactly at quorum -> refused.
+        degraded = [_mv(1, "a", healthy=False)] + [_mv(i, f"m{i}") for i in range(2, 6)]
+        with self.assertRaises(CoreError):
+            assess_addition(degraded)
 
 
 class AssessRemovalTests(unittest.TestCase):
@@ -288,3 +337,35 @@ class RemoveNodeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProbeCredentialsTests(unittest.TestCase):
+    """Member probes issue Maintenance RPCs, which etcd RBAC limits to root.
+
+    Regression: connecting as the ordinary user made every Status probe fail
+    PERMISSION_DENIED, so every member read as unhealthy and every quorum guard
+    refused forever — a fail-closed guard that could never open.
+    """
+
+    def test_client_for_uses_root_credentials(self):
+        with mock.patch("hetzman.config.load_etcd_admin_credentials",
+                        return_value=("root", "s3cret")), \
+             mock.patch("etcd3.client") as client:
+            nodes._client_for("10.0.0.4", 2379)
+        kwargs = client.call_args.kwargs
+        self.assertEqual(kwargs["user"], "root")
+        self.assertEqual(kwargs["password"], "s3cret")
+
+    def test_admin_credentials_prefer_root_file(self):
+        from hetzman import config
+
+        with mock.patch.object(config, "_read_credentials",
+                               side_effect=lambda p: ("root", "r") if "root" in p else ("hetzman", "h")):
+            self.assertEqual(config.load_etcd_admin_credentials(), ("root", "r"))
+
+    def test_admin_credentials_fall_back_when_no_root_file(self):
+        from hetzman import config
+
+        with mock.patch.object(config, "_read_credentials",
+                               side_effect=lambda p: (None, None) if "root" in p else ("hetzman", "h")):
+            self.assertEqual(config.load_etcd_admin_credentials(), ("hetzman", "h"))

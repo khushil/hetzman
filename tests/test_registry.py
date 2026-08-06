@@ -35,6 +35,30 @@ def test_bridge_ip_outside_subnet_fails():
     assert any("not in" in e for e in errors)
 
 
+def test_bridge_subnet_outside_container_supernet_fails():
+    """A standalone Incus host bootstrapped with its own addressing (e.g. the
+    10.60.0.0/24 default of bootstrap-fsn1.sh) validates on every other rule but
+    would silently get no NAT and no reverse DNS, because both are rendered
+    against 10.100.0.0/16."""
+    fleet = make_fleet()
+    fleet["htz-hel1-dc12-bm-01"]["bridge_ip"] = "10.60.0.1"
+    fleet["htz-hel1-dc12-bm-01"]["bridge_subnet"] = "10.60.0.0/24"
+    errors = validate_registry(fleet)
+    assert any("outside" in e and "10.100.0.0/16" in e for e in errors)
+
+
+def test_vswitch_ip_outside_vswitch_subnet_fails():
+    fleet = make_fleet()
+    fleet["htz-hel1-dc12-bm-01"]["vswitch_ip"] = "10.9.9.9"
+    errors = validate_registry(fleet)
+    assert any("outside" in e and "10.0.0.0/24" in e for e in errors)
+
+
+def test_supernet_check_accepts_the_real_fleet():
+    """Guard against the new rule rejecting the live topology."""
+    assert validate_registry(make_fleet()) == []
+
+
 def test_missing_field_fails():
     fleet = make_fleet()
     del fleet["htz-hel1-dc3-bm-01"]["etcd_name"]

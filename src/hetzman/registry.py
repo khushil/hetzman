@@ -11,6 +11,9 @@ import ipaddress
 from typing import Any, Dict, List
 
 from .etcd_kv import get_all_with_prefix
+# render.py is stdlib+yaml only (no console, no etcd), so importing its
+# addressing constants here is safe and keeps a single source of truth.
+from .render import CONTAINER_SUPERNET, VSWITCH_SUBNET
 
 NODES_PREFIX = "/hetzman/nodes/"
 SCHEMA_VERSION = 1
@@ -74,6 +77,22 @@ def validate_registry(nodes: Dict[str, dict]) -> List[str]:
 
         if bridge not in subnet:
             errors.append(f"{name}: bridge_ip {bridge} not in {subnet}")
+
+        # The addressing plan is load-bearing, not a convention: the NAT
+        # masquerade rules and the authoritative reverse zone are rendered
+        # against the whole supernet (render.py:CONTAINER_SUPERNET,
+        # DNS_REVERSE_ZONES), and the vSwitch accepts against VSWITCH_SUBNET.
+        # A node addressed outside them registers and validates happily, then
+        # silently gets no outbound NAT and no reverse DNS — so reject it here.
+        supernet = ipaddress.ip_network(CONTAINER_SUPERNET)
+        if not subnet.subnet_of(supernet):
+            errors.append(
+                f"{name}: bridge_subnet {subnet} is outside {supernet} — it would "
+                "get no NAT and no reverse DNS"
+            )
+        vswitch_net = ipaddress.ip_network(VSWITCH_SUBNET)
+        if vswitch not in vswitch_net:
+            errors.append(f"{name}: vswitch_ip {vswitch} is outside {vswitch_net}")
         if not isinstance(node["vlan_id"], int) or not isinstance(node["mtu"], int):
             errors.append(f"{name}: vlan_id/mtu must be integers")
 
@@ -91,8 +110,6 @@ def validate_registry(nodes: Dict[str, dict]) -> List[str]:
                     f"{name}: bridge_subnet {subnet} overlaps {other_subnet} ({other_name})"
                 )
         subnets[subnet] = name
-
-        _ = vswitch  # uniqueness handled above; addressability validated
 
     return errors
 

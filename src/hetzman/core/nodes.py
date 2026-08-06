@@ -139,6 +139,39 @@ def assess_reboot(members: list[MemberView], target_id: int) -> None:
         )
 
 
+def assess_addition(members: list[MemberView]) -> None:
+    """Raise CoreError if adding a VOTING member right now is unsafe.
+
+    Growing the cluster raises quorum immediately, while the new member is not
+    yet healthy — so the margin has to come from the members that already exist.
+    A bare "is there a quorum?" check is not enough: at 3-of-4 healthy it passes,
+    yet the resulting 5-member cluster has quorum 3 with exactly 3 healthy, and
+    one further fault stops writes. So mirror :func:`assess_removal` and demand
+    the healthy voters EXCEED the post-change quorum — a 4->5 addition therefore
+    requires all four existing members healthy.
+
+    Note this guards the moment a member becomes a VOTER. Joining as a learner
+    first (``etcdctl member add --learner``) does not change quorum at all, so
+    the guard belongs on the promotion, not on the join.
+    """
+    n = len(members)
+    if not members:
+        raise CoreError("refusing: could not read cluster membership")
+    if any(not m.name for m in members):
+        raise CoreError(
+            "refusing: an etcd member is unstarted/joining (topology mid-transition)"
+        )
+    n_after = n + 1
+    quorum_after = n_after // 2 + 1
+    healthy = sum(1 for m in members if m.healthy)
+    if healthy <= quorum_after:
+        raise CoreError(
+            f"refusing addition: would leave no spare healthy voter "
+            f"({healthy} healthy vs quorum {quorum_after} of {n_after}); "
+            "need a margin of at least one"
+        )
+
+
 def lookup_member(name: str) -> tuple[Optional[MemberView], list[MemberView]]:
     """Return (this node's etcd member or None, all members) — None when the node
     is not in the registry or maps to no current member."""
@@ -198,12 +231,22 @@ def _url_hostport(url: str) -> tuple[str, int]:
 
 
 def _client_for(host: str, port: int):
+    """A short-timeout client for probing a single member.
+
+    Uses the ROOT credentials: these clients only ever issue Maintenance RPCs
+    (Status) and member-list/remove, and etcd RBAC restricts Maintenance to the
+    root role. Connecting as the ordinary user makes every Status probe fail
+    PERMISSION_DENIED, which silently reads as "member unhealthy" and jams every
+    quorum guard shut.
+    """
     import os
+    user, password = config.load_etcd_admin_credentials()
     return etcd3.client(
         host=host, port=port, timeout=_PROBE_TIMEOUT,
         ca_cert=config.ETCD_CA_CERT if os.path.exists(config.ETCD_CA_CERT) else None,
         cert_cert=config.ETCD_CLIENT_CERT if os.path.exists(config.ETCD_CLIENT_CERT) else None,
         cert_key=config.ETCD_CLIENT_KEY if os.path.exists(config.ETCD_CLIENT_KEY) else None,
+        user=user, password=password,
     )
 
 

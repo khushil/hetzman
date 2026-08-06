@@ -25,6 +25,12 @@ CONFIG_FILE = os.environ.get("HETZMAN_CONFIG_FILE", "/opt/hetzman-tooling/config
 ADDITIONAL_HOSTS = "/opt/hetzman-tooling/configs/additional-hosts"
 LOG_FILE = "/var/log/hetzman-tooling/hetzman.log"
 ETCD_CREDS_FILE = os.environ.get("HETZMAN_ETCD_CREDS_FILE", "/opt/hetzman-tooling/etcd-credentials")
+# etcd RBAC gives the day-to-day `hetzman` user a restricted role that CANNOT
+# call Maintenance RPCs (Status, snapshot save) — those need the root role.
+# scripts/etcd-backup.sh already relies on this file for `snapshot save`.
+ETCD_ROOT_CREDS_FILE = os.environ.get(
+    "HETZMAN_ETCD_ROOT_CREDS_FILE", "/opt/hetzman-tooling/etcd-root-credentials"
+)
 ETCD_CA_CERT = os.environ.get("HETZMAN_ETCD_CA_CERT", "/opt/hetzman-tooling/certs/ca.pem")
 ETCD_CLIENT_CERT = os.environ.get("HETZMAN_ETCD_CLIENT_CERT", "/opt/hetzman-tooling/certs/client.pem")
 ETCD_CLIENT_KEY = os.environ.get("HETZMAN_ETCD_CLIENT_KEY", "/opt/hetzman-tooling/certs/client-key.pem")
@@ -92,17 +98,39 @@ def is_external() -> bool:
     return get_settings().current_server is None
 
 
-def _load_etcd_credentials() -> tuple[Optional[str], Optional[str]]:
-    if not os.path.exists(ETCD_CREDS_FILE):
+def _read_credentials(path: str) -> tuple[Optional[str], Optional[str]]:
+    """Parse a ``user:password`` credentials file; (None, None) if unusable."""
+    if not os.path.exists(path):
         return None, None
     try:
-        with open(ETCD_CREDS_FILE) as f:
+        with open(path) as f:
             creds = f.read().strip()
     except OSError:
         return None, None
     if ":" not in creds:
         return None, None
     user, password = creds.split(":", 1)
+    return user, password
+
+
+def _load_etcd_credentials() -> tuple[Optional[str], Optional[str]]:
+    return _read_credentials(ETCD_CREDS_FILE)
+
+
+def load_etcd_admin_credentials() -> tuple[Optional[str], Optional[str]]:
+    """Credentials for Maintenance RPCs (Status / snapshot), which etcd RBAC
+    restricts to the root role.
+
+    The quorum guards probe every member's Status to decide liveness. Connecting
+    as the ordinary ``hetzman`` user makes that probe fail with PERMISSION_DENIED
+    on every member, so every member reads as unhealthy and assess_reboot /
+    assess_removal / assess_addition / member_caught_up all refuse forever —
+    a fail-closed guard that can never open. Falls back to the ordinary
+    credentials when no root file exists (an auth-disabled cluster).
+    """
+    user, password = _read_credentials(ETCD_ROOT_CREDS_FILE)
+    if user is None:
+        return _load_etcd_credentials()
     return user, password
 
 

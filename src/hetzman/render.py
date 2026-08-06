@@ -28,6 +28,11 @@ VSWITCH_SUBNET = "10.0.0.0/24"
 CONTAINER_SUPERNET = "10.100.0.0/16"
 INCUS_BRIDGE = "incusbr0"
 ROUTE_METRIC = 100
+# The custom nat-table chains the base ruleset jumps into. They must EXIST
+# before those jumps can be added, which is not true on a freshly provisioned
+# node — see commands/node.py:_ensure_nat_chains. Kept in step with the rendered
+# ruleset by test_node_iptables.py.
+NAT_CUSTOM_CHAINS: Tuple[str, ...] = ("HETZMAN_NAT", "HETZMAN_NAT_POST")
 
 MANAGED_HEADER = "# Managed by hetzman node-sync - do not edit by hand\n"
 
