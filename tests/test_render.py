@@ -310,3 +310,42 @@ def test_netplan_routes_sorted_and_order_insensitive():
     reversed_doc = copy.deepcopy(doc)
     reversed_doc["network"]["vlans"]["enp5s0.4000"]["routes"] = list(reversed(routes))
     assert netplan_semantically_equal(text, yaml.safe_dump(reversed_doc))
+
+
+# --------------------------------------------------------------------------
+# Cross-node reachability: instances -> a PEER host's services
+
+def _self_and_fleet():
+    fleet = make_fleet()
+    return fleet["htz-hel1-dc12-bm-01"], fleet
+
+
+def test_peer_instances_may_reach_this_host():
+    """A container already has unrestricted access to its OWN host via the
+    bridge rule; peer hosts must match, or instances can reach a peer's
+    instances but none of its services."""
+    from hetzman.render import CONTAINER_SUPERNET, INCUS_BRIDGE, render_iptables_base
+
+    self_node, nodes = _self_and_fleet()
+    text = render_iptables_base(self_node, nodes)
+    assert f"-A INPUT -i {INCUS_BRIDGE} -j ACCEPT" in text
+    assert f"-A INPUT -s {CONTAINER_SUPERNET} -j ACCEPT" in text
+
+
+def test_supernet_accept_is_in_both_the_base_and_the_live_ensure():
+    """Drift tripwire: the rendered base and the live-ensure list must agree,
+    otherwise node-sync reports drift on every single run."""
+    from hetzman.render import CONTAINER_SUPERNET, base_ensure_rules, render_iptables_base
+
+    self_node, nodes = _self_and_fleet()
+    assert f"-A INPUT -s {CONTAINER_SUPERNET} -j ACCEPT" in render_iptables_base(self_node, nodes)
+    assert ("filter", "INPUT", ["-s", CONTAINER_SUPERNET, "-j", "ACCEPT"]) in \
+        base_ensure_rules(self_node, nodes)
+
+
+def test_supernet_accept_does_not_widen_the_dns_acl():
+    """The :53 ACL guard must still pass — this rule is not a DNS widening."""
+    from hetzman.render import base_ensure_rules
+
+    self_node, nodes = _self_and_fleet()
+    base_ensure_rules(self_node, nodes)   # raises RenderError if the guard trips

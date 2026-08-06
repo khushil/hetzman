@@ -298,6 +298,16 @@ def render_iptables_base(
             ":FORWARD ACCEPT [0:0]",
             ":OUTPUT ACCEPT [0:0]",
             f"-A INPUT -i {INCUS_BRIDGE} -j ACCEPT",
+            # Instances on PEER nodes, reaching this host's services.
+            #
+            # The rule above already gives a container unrestricted access to
+            # its OWN host — every port, including etcd and the Incus API.
+            # Without this line the same container can reach a peer host's
+            # *instances* but none of that host's *services*, which is an
+            # inconsistency rather than a security boundary. Container traffic
+            # to a 10.0.0.0/8 destination is deliberately not masqueraded, so it
+            # arrives sourced from CONTAINER_SUPERNET and is matched here.
+            f"-A INPUT -s {CONTAINER_SUPERNET} -j ACCEPT",
             "-A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT",
             "-A INPUT -i lo -j ACCEPT",
             "-A INPUT -p tcp -m tcp --dport 22 -j ACCEPT",
@@ -374,6 +384,9 @@ def base_ensure_rules(
         ("mangle", "FORWARD", ["-p", "tcp", "-m", "tcp", "--tcp-flags", "SYN,RST", "SYN",
                                "-j", "TCPMSS", "--clamp-mss-to-pmtu"]),
         ("filter", "INPUT", ["-i", INCUS_BRIDGE, "-j", "ACCEPT"]),
+        # Mirrors render_iptables_base — the two MUST agree or node-sync reports
+        # drift on every run.
+        ("filter", "INPUT", ["-s", CONTAINER_SUPERNET, "-j", "ACCEPT"]),
         ("filter", "INPUT", ["-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"]),
         ("filter", "INPUT", ["-i", "lo", "-j", "ACCEPT"]),
         ("filter", "INPUT", ["-p", "tcp", "-m", "tcp", "--dport", "22", "-j", "ACCEPT"]),
