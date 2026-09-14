@@ -27,6 +27,12 @@ DOMAIN = "daemondreams.home.arpa"
 VSWITCH_SUBNET = "10.0.0.0/24"
 CONTAINER_SUPERNET = "10.100.0.0/16"
 INCUS_BRIDGE = "incusbr0"
+# Fleet PostgreSQL. Rendered on every node (like 8443) rather than only the node
+# that happens to run it: the base is identical fleet-wide, and the rule is inert
+# where nothing listens. postgresql's own pg_hba.conf already admits the vSwitch
+# (hostssl all all 10.0.0.0/24 scram-sha-256) — without this the firewall
+# contradicted it, so only containers could reach the DB and hosts could not.
+POSTGRES_PORT = "5432"
 ROUTE_METRIC = 100
 # The custom nat-table chains the base ruleset jumps into. They must EXIST
 # before those jumps can be added, which is not true on a freshly provisioned
@@ -312,6 +318,7 @@ def render_iptables_base(
             "-A INPUT -i lo -j ACCEPT",
             "-A INPUT -p tcp -m tcp --dport 22 -j ACCEPT",
             f"-A INPUT -s {VSWITCH_SUBNET} -p tcp -m tcp --dport 8443 -j ACCEPT",
+            f"-A INPUT -s {VSWITCH_SUBNET} -p tcp -m tcp --dport {POSTGRES_PORT} -j ACCEPT",
             *dns_accepts,
             *accepts,
             "-A INPUT -p icmp -m icmp --icmp-type 8 -j ACCEPT",
@@ -392,6 +399,8 @@ def base_ensure_rules(
         ("filter", "INPUT", ["-p", "tcp", "-m", "tcp", "--dport", "22", "-j", "ACCEPT"]),
         ("filter", "INPUT", ["-s", VSWITCH_SUBNET, "-p", "tcp", "-m", "tcp",
                              "--dport", "8443", "-j", "ACCEPT"]),
+        ("filter", "INPUT", ["-s", VSWITCH_SUBNET, "-p", "tcp", "-m", "tcp",
+                             "--dport", POSTGRES_PORT, "-j", "ACCEPT"]),
     ]
     for cidr in trusted:
         rules.append(("filter", "INPUT", ["-s", cidr, "-p", "udp", "-m", "udp",

@@ -349,3 +349,43 @@ def test_supernet_accept_does_not_widen_the_dns_acl():
 
     self_node, nodes = _self_and_fleet()
     base_ensure_rules(self_node, nodes)   # raises RenderError if the guard trips
+
+
+def test_hosts_may_reach_fleet_postgres_over_the_vswitch():
+    """pg_hba.conf admits the whole vSwitch; the firewall must not contradict it.
+    Without this rule a container could reach the DB but its own host could not."""
+    from hetzman.render import POSTGRES_PORT, VSWITCH_SUBNET, render_iptables_base
+
+    self_node, nodes = _self_and_fleet()
+    assert f"-A INPUT -s {VSWITCH_SUBNET} -p tcp -m tcp --dport {POSTGRES_PORT} -j ACCEPT" \
+        in render_iptables_base(self_node, nodes)
+
+
+def test_postgres_accept_is_in_both_the_base_and_the_live_ensure():
+    """Drift tripwire, as for the supernet accept: base and live-ensure must agree."""
+    from hetzman.render import (
+        POSTGRES_PORT,
+        VSWITCH_SUBNET,
+        base_ensure_rules,
+        render_iptables_base,
+    )
+
+    self_node, nodes = _self_and_fleet()
+    assert f"-A INPUT -s {VSWITCH_SUBNET} -p tcp -m tcp --dport {POSTGRES_PORT} -j ACCEPT" \
+        in render_iptables_base(self_node, nodes)
+    assert ("filter", "INPUT", ["-s", VSWITCH_SUBNET, "-p", "tcp", "-m", "tcp",
+                                "--dport", POSTGRES_PORT, "-j", "ACCEPT"]) in \
+        base_ensure_rules(self_node, nodes)
+
+
+def test_postgres_accept_is_scoped_to_the_private_vswitch():
+    """Never widen beyond the vSwitch — 5432 must carry a private -s scope."""
+    from hetzman.render import POSTGRES_PORT, VSWITCH_SUBNET, render_iptables_base
+
+    self_node, nodes = _self_and_fleet()
+    lines = [ln for ln in render_iptables_base(self_node, nodes).splitlines()
+             if f"--dport {POSTGRES_PORT}" in ln]
+    assert lines, "no postgres rule rendered"
+    for line in lines:
+        assert f"-s {VSWITCH_SUBNET}" in line
+        assert "0.0.0.0/0" not in line
