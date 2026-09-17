@@ -41,13 +41,17 @@ from ..registry import (
 )
 from ..render import (
     DNS_LEASEFILE,
+    FILTER_CUSTOM_CHAINS,
+    HOSTPORTS_CHAIN,
     MANAGED_HEADER,
     NAT_CUSTOM_CHAINS,
     RenderError,
     TRUSTED_DNS_CLIENTS,
+    _host_port_argv,
     base_ensure_rules,
     base_policies,
     dns_acl_source_ok,
+    host_port_ok,
     iptables_cleanup_plan,
     netplan_semantically_equal,
     render_dnsmasq_conf,
@@ -70,6 +74,12 @@ ETCD_CONF = "/etc/etcd.conf"
 STATE_DIR = "/var/lib/hetzman"
 DNSMASQ_DOWN_SENTINEL = "/var/lib/hetzman/dnsmasq-down"
 TRUSTED_DNS_CLIENTS_KEY = "/hetzman/config/trusted-dns-clients"
+# One etcd key PER host-port entry, not a JSON list in a single key:
+# add is a put, close is a delete, and two operators editing different ports
+# cannot clobber each other - so no read-modify-write and no CAS. Mirrors the
+# existing /hetzman/port-forward/<server>/<instance>-<port>-<proto> shape.
+# Per-NODE, so opening a port here never opens it on the peer.
+HOST_PORTS_PREFIX = "/hetzman/host-ports"
 LAST_SYNC_FILE = f"{STATE_DIR}/last-node-sync.json"
 SYNC_LOG = "/var/log/hetzman-tooling/node-sync.log"
 
@@ -237,6 +247,59 @@ def _trusted_dns_clients() -> List[str]:
     except Exception as e:  # noqa: BLE001 — must never break node-sync
         _sync_log([f"trusted-dns-clients: read/parse failed, using vSwitch only: {e}"])
     return trusted
+
+
+def _host_ports(node_name: str) -> List[dict]:
+    """Operator-opened host ports for THIS node, from etcd.
+
+    Fail-closed the same way :func:`_trusted_dns_clients` is: a malformed entry
+    is logged and dropped, a read failure yields an empty list, and nothing in
+    here may raise. The renderer's ``_assert_host_ports_safe`` would abort the
+    entire node-sync run (no DNS, no netplan, no firewall, no systemd) on bad
+    operator data, so this filter is what keeps that backstop unreachable.
+
+    Exact-key lookup per entry under the node's own prefix - deliberately NOT a
+    scan of ``/hetzman/host-ports/`` as a whole, which would open every node's
+    ports on every node.
+    """
+    prefix = f"{HOST_PORTS_PREFIX}/{node_name}/"
+    entries: List[dict] = []
+    try:
+        for key, raw in sorted((get_all_with_prefix(prefix) or {}).items()):
+            if not key.startswith(prefix):
+                continue
+            if host_port_ok(raw):
+                entries.append(raw)
+            else:
+                _sync_log([f"host-ports: rejected malformed entry at {key}: {raw!r}"])
+    except Exception as e:  # noqa: BLE001 — must never break node-sync
+        _sync_log([f"host-ports: read/parse failed, opening none: {e}"])
+    return entries
+
+
+def _desired_host_port_rules(host_ports: List[dict]) -> List[List[str]]:
+    """Deduplicated argv for the HETZMAN_HOSTPORTS chain, in rendered order."""
+    seen, out = set(), []
+    for entry in host_ports:
+        argv = _host_port_argv(entry)
+        if tuple(argv) in seen:
+            continue
+        seen.add(tuple(argv))
+        out.append(argv)
+    return out
+
+
+def _live_host_port_rules() -> List[List[str]]:
+    """What the HETZMAN_HOSTPORTS chain currently holds, as argv lists."""
+    result = _run(["iptables", "-w", "5", "-S", HOSTPORTS_CHAIN], timeout=10)
+    if result.returncode != 0:
+        return []
+    rules = []
+    for line in (result.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) > 2 and parts[0] == "-A" and parts[1] == HOSTPORTS_CHAIN:
+            rules.append(parts[2:])
+    return rules
 
 
 def _apply_dnsmasq(
@@ -578,8 +641,8 @@ def _iptables_live_missing(
     return missing
 
 
-def _ensure_nat_chains() -> None:
-    """Create the custom nat chains if they do not exist yet.
+def _ensure_custom_chains() -> None:
+    """Create the custom nat AND filter chains if they do not exist yet.
 
     The base ruleset jumps PREROUTING/POSTROUTING into HETZMAN_NAT and
     HETZMAN_NAT_POST. On a freshly provisioned node neither chain exists, so the
@@ -588,15 +651,39 @@ def _ensure_nat_chains() -> None:
     but it runs at the END of node-sync, so the FIRST run on any new node always
     reported errors and only the second run came back clean.
 
+    The same applies to the filter table: the base ruleset jumps INPUT into
+    HETZMAN_HOSTPORTS, and that jump fails identically if the chain is absent.
+
     Creating a chain that already exists is an error we deliberately ignore;
     this is idempotent and additive, and never touches rules.
     """
-    for chain in NAT_CUSTOM_CHAINS:
-        exists = _run(
-            ["iptables", "-w", "5", "-t", "nat", "-L", chain, "-n"], timeout=10
-        ).returncode == 0
-        if not exists:
-            _run(["iptables", "-w", "5", "-t", "nat", "-N", chain], timeout=10)
+    for table, chains in (("nat", NAT_CUSTOM_CHAINS), ("filter", FILTER_CUSTOM_CHAINS)):
+        for chain in chains:
+            exists = _run(
+                ["iptables", "-w", "5", "-t", table, "-L", chain, "-n"], timeout=10
+            ).returncode == 0
+            if not exists:
+                _run(["iptables", "-w", "5", "-t", table, "-N", chain], timeout=10)
+
+
+def _apply_host_ports(desired: List[List[str]]) -> List[str]:
+    """Flush and rebuild HETZMAN_HOSTPORTS from etcd. Returns error strings.
+
+    Flush-and-rebuild rather than incremental add, because the ensure path
+    (iptables -C || -A) cannot express removal: without this, closing a port
+    would leave it open until the next reboot while --check reported clean.
+    """
+    errors: List[str] = []
+    flush = _run(["iptables", "-w", "5", "-t", "filter", "-F", HOSTPORTS_CHAIN], timeout=10)
+    if flush.returncode != 0:
+        return [f"host-ports: flush failed: {flush.stderr.strip()}"]
+    for argv in desired:
+        result = _run(
+            ["iptables", "-w", "5", "-t", "filter", "-A", HOSTPORTS_CHAIN, *argv], timeout=10
+        )
+        if result.returncode != 0:
+            errors.append(f"host-ports: add {' '.join(argv)} failed: {result.stderr.strip()}")
+    return errors
 
 
 def _systemd_changes() -> List[str]:
@@ -707,8 +794,12 @@ def _node_sync_run(apply: bool) -> int:
         )
 
     trusted_dns = _trusted_dns_clients()
+    host_ports = _host_ports(settings.current_server)
+    desired_hostport_rules = _desired_host_port_rules(host_ports)
     try:
-        desired_base_v4 = render_iptables_base(self_node, nodes, trusted_dns_clients=trusted_dns)
+        desired_base_v4 = render_iptables_base(
+            self_node, nodes, trusted_dns_clients=trusted_dns, host_ports=host_ports
+        )
         desired_base_v6 = render_iptables_base_v6()
     except RenderError as e:
         console.print(f"[red]render: {e}[/red]")
@@ -724,6 +815,12 @@ def _node_sync_run(apply: bool) -> int:
     live_save = _run(["iptables-save"], timeout=15).stdout or ""
     deletions, cleanup_warnings = iptables_cleanup_plan(live_save, nodes)
     warnings.extend(cleanup_warnings)
+    # Host-port drift is computed as desired-vs-live in BOTH directions. The
+    # generic live_missing path only ever reports additions, so without this a
+    # closed port would linger in the live chain and --check would say "clean".
+    hostport_drift = _live_host_port_rules() != desired_hostport_rules
+    if hostport_drift:
+        pending.append(f"host-ports({len(desired_hostport_rules)} desired)")
     if live_missing:
         pending.append(f"iptables-live(+{len(live_missing)})")
     if deletions:
@@ -748,6 +845,26 @@ def _node_sync_run(apply: bool) -> int:
                 for line in diff[:80]:
                     color = "green" if line.startswith("+") else "red" if line.startswith("-") else "dim"
                     console.print(f"[{color}]{line}[/{color}]")
+        if base_drift:
+            # Same treatment dnsmasq.conf gets: on a box with no console, seeing
+            # exactly which firewall lines would change before applying them is
+            # the difference between a safe apply and a guess.
+            diff = list(difflib.unified_diff(
+                (_read(RULES_V4_BASE) or "").splitlines(), desired_base_v4.splitlines(),
+                fromfile="rules.v4.hetzman-base (live)",
+                tofile="rules.v4.hetzman-base (desired)", lineterm="",
+            ))
+            if diff:
+                console.print("[cyan]iptables base diff:[/cyan]")
+                for line in diff[:80]:
+                    color = "green" if line.startswith("+") else "red" if line.startswith("-") else "dim"
+                    console.print(f"[{color}]{line}[/{color}]")
+        if hostport_drift:
+            console.print("[cyan]host-ports (live -> desired):[/cyan]")
+            for argv in _live_host_port_rules():
+                console.print(f"[red]- {' '.join(argv)}[/red]")
+            for argv in desired_hostport_rules:
+                console.print(f"[green]+ {' '.join(argv)}[/green]")
         if pending:
             console.print(f"[yellow]Drift detected: {', '.join(pending)}[/yellow]")
             return 1
@@ -790,7 +907,7 @@ def _node_sync_run(apply: bool) -> int:
                 _run(["netplan", "apply"], timeout=60)
 
     # iptables: live ensure first (additive), then deletions, then base files.
-    _ensure_nat_chains()
+    _ensure_custom_chains()
     for table, _chain, _args in base_policies():
         _run(["iptables", "-w", "5", "-t", table, "-P", _chain, _args], timeout=10)
     for table, chain, args in live_missing:
@@ -799,6 +916,12 @@ def _node_sync_run(apply: bool) -> int:
             errors.append(f"iptables ensure {table}/{chain} failed: {result.stderr.strip()}")
     if live_missing:
         changed.append("iptables-live")
+
+    if hostport_drift:
+        hp_errors = _apply_host_ports(desired_hostport_rules)
+        errors.extend(hp_errors)
+        if not hp_errors:
+            changed.append("host-ports")
 
     for table, args in deletions:
         result = _run(["iptables", "-w", "5", "-t", table, "-D", *args], timeout=10)

@@ -39,6 +39,20 @@ ROUTE_METRIC = 100
 # node — see commands/node.py:_ensure_nat_chains. Kept in step with the rendered
 # ruleset by test_node_iptables.py.
 NAT_CUSTOM_CHAINS: Tuple[str, ...] = ("HETZMAN_NAT", "HETZMAN_NAT_POST")
+# Operator-opened host ports live in their OWN filter chain, not appended to
+# INPUT. The live-ensure path (iptables -C || -A) can only ADD rules, so a port
+# removed from etcd would stay open until the next reboot while node-sync
+# happily reported "clean". An owned chain is flushed and rebuilt from etcd on
+# every apply, which makes removal correct by construction and the rule order
+# deterministic. Mirrors network.py:apply_nat_rules, the same pattern for NAT.
+HOSTPORTS_CHAIN = "HETZMAN_HOSTPORTS"
+FILTER_CUSTOM_CHAINS: Tuple[str, ...] = (HOSTPORTS_CHAIN,)
+# Ports an operator may NOT open through this mechanism. Two kinds: ports the
+# renderer already manages (opening them again is a second source of truth that
+# will drift), and ports whose service must never face the public internet even
+# by accident (OpenBao). Derived from the constants above so this cannot rot
+# independently of the rules it guards.
+OPENBAO_PORTS: Tuple[str, ...] = ("8200", "8201")
 
 MANAGED_HEADER = "# Managed by hetzman node-sync - do not edit by hand\n"
 
@@ -79,6 +93,86 @@ def dns_acl_source_ok(cidr: str) -> bool:
     if net.version != 4 or net.prefixlen < 16:
         return False
     return any(net.subnet_of(s) for s in _RFC1918)
+
+
+def reserved_host_ports() -> frozenset:
+    """Ports an operator may not open via the host-port mechanism.
+
+    Derived from the constants the renderer already emits rules for, plus
+    OpenBao. Never hardcode a second copy of this list: a literal would drift
+    the moment a new managed rule is added, and the failure mode is silent.
+    """
+    return frozenset(
+        {"22", "53", "2379", "2380", "8443", POSTGRES_PORT} | set(OPENBAO_PORTS)
+    )
+
+
+def host_port_ok(entry: dict) -> bool:
+    """True iff ``entry`` is a well-formed host-port record.
+
+    Deliberately NOT modelled on :func:`dns_acl_source_ok`. That predicate
+    demands a private, narrow CIDR because a public resolver is a hazard. A
+    host port's whole purpose may be to face the internet, so ``0.0.0.0/0`` is
+    VALID here. This checks shape only; policy (reserved ports) is enforced at
+    CLI write time, where an operator can see the error.
+    """
+    if not isinstance(entry, dict):
+        return False
+    try:
+        port = int(entry["port"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not 1 <= port <= 65535:
+        return False
+    if entry.get("protocol", "tcp") not in ("tcp", "udp"):
+        return False
+    try:
+        ipaddress.ip_network(str(entry.get("source", "0.0.0.0/0")), strict=False)
+    except ValueError:
+        return False
+    return True
+
+
+def _host_port_argv(entry: dict) -> List[str]:
+    """Canonical argv for one host-port ACCEPT, without the chain name.
+
+    ``0.0.0.0/0`` is emitted as NO ``-s`` at all, because that is how
+    ``iptables-save`` renders a match-anything source. Emitting it literally
+    would differ from what the kernel reports and drift forever.
+    """
+    proto = entry.get("protocol", "tcp")
+    source = str(entry.get("source", "0.0.0.0/0"))
+    args: List[str] = []
+    if ipaddress.ip_network(source, strict=False).prefixlen != 0:
+        args += ["-s", source]
+    args += ["-p", proto, "-m", proto, "--dport", str(int(entry["port"])), "-j", "ACCEPT"]
+    return args
+
+
+def _host_port_accepts(host_ports: Sequence[dict]) -> List[str]:
+    """Rendered ``-A HETZMAN_HOSTPORTS ...`` lines, deduplicated, stable order."""
+    seen = set()
+    lines: List[str] = []
+    for entry in host_ports:
+        argv = tuple(_host_port_argv(entry))
+        if argv in seen:
+            continue
+        seen.add(argv)
+        lines.append(f"-A {HOSTPORTS_CHAIN} " + " ".join(argv))
+    return lines
+
+
+def _assert_host_ports_safe(host_ports: Sequence[dict]) -> None:
+    """Unreachable backstop for a programming error.
+
+    Operator data is filtered and logged upstream in
+    ``commands/node.py:_host_ports`` - malformed etcd content must degrade to
+    an empty list, never abort node-sync. If a malformed entry reaches here it
+    means the filter was bypassed in code, which is a bug worth failing on.
+    """
+    for entry in host_ports:
+        if not host_port_ok(entry):
+            raise RenderError(f"malformed host-port entry reached renderer: {entry!r}")
 
 
 class RenderError(Exception):
@@ -271,7 +365,12 @@ def _assert_dns_acl_safe(text_lines: Sequence[str]) -> None:
     actual rendered/applied rules, so an ``-i``-only or public ``-s`` is caught.
     """
     for line in text_lines:
-        if "--dport 53" not in line:
+        # Token match, NOT substring: "--dport 53" is a prefix of "--dport 5353"
+        # (and 530, 53000, ...), so a substring test would drag an unrelated
+        # high port into the :53 ACL check and raise RenderError on it. A
+        # RenderError here aborts the WHOLE node-sync run - no DNS, no netplan,
+        # no firewall, no systemd - silently, every 15 minutes.
+        if not re.search(r"--dport 53(?![\d:])", line):
             continue
         match = re.search(r"-s (\S+)", line)
         if not match or not dns_acl_source_ok(match.group(1)):
@@ -282,11 +381,15 @@ def render_iptables_base(
     self_node: dict,
     nodes: Dict[str, dict],
     trusted_dns_clients: Optional[Sequence[str]] = None,
+    host_ports: Optional[Sequence[dict]] = None,
 ) -> str:
     subnet = self_node["bridge_subnet"]
     accepts = _etcd_accepts(nodes)
     trusted = list(TRUSTED_DNS_CLIENTS if trusted_dns_clients is None else trusted_dns_clients)
     dns_accepts = _dns_accepts(trusted)
+    hostports = list(host_ports or [])
+    _assert_host_ports_safe(hostports)
+    hostport_accepts = _host_port_accepts(hostports)
     text = "\n".join(
         [
             "# Managed by hetzman node-sync (canonical base; per-instance NAT is",
@@ -303,6 +406,9 @@ def render_iptables_base(
             ":INPUT DROP [0:0]",
             ":FORWARD ACCEPT [0:0]",
             ":OUTPUT ACCEPT [0:0]",
+            # iptables-restore requires every chain to be declared before any
+            # rule references it, so this must stay above the jump below.
+            f":{HOSTPORTS_CHAIN} - [0:0]",
             f"-A INPUT -i {INCUS_BRIDGE} -j ACCEPT",
             # Instances on PEER nodes, reaching this host's services.
             #
@@ -322,6 +428,12 @@ def render_iptables_base(
             *dns_accepts,
             *accepts,
             "-A INPUT -p icmp -m icmp --icmp-type 8 -j ACCEPT",
+            # Operator-opened ports. Placement is cosmetic: INPUT is ACCEPT-only
+            # under policy DROP, so there is no earlier DROP/REJECT/RETURN for
+            # ordering to interact with. What must match exactly is the argv
+            # SPELLING shared with base_ensure_rules.
+            f"-A INPUT -j {HOSTPORTS_CHAIN}",
+            *hostport_accepts,
             "-A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT",
             f"-A FORWARD -s {subnet} -j ACCEPT",
             f"-A FORWARD -d {subnet} -j ACCEPT",
@@ -401,6 +513,15 @@ def base_ensure_rules(
                              "--dport", "8443", "-j", "ACCEPT"]),
         ("filter", "INPUT", ["-s", VSWITCH_SUBNET, "-p", "tcp", "-m", "tcp",
                              "--dport", POSTGRES_PORT, "-j", "ACCEPT"]),
+        # The JUMP is ensured here; the chain's CONTENTS deliberately are not.
+        # This path is iptables -C || -A, which can only add - it has no way to
+        # express "this rule should no longer be present", which is exactly what
+        # closing a port requires. The contents are reconciled instead by
+        # flush-and-rebuild in commands/node.py:_apply_host_ports, so a port
+        # removed from etcd actually closes. The chain itself is created by
+        # _ensure_custom_chains before this list is applied; without it every
+        # jump would fail with "Chain does not exist" on a fresh node.
+        ("filter", "INPUT", ["-j", HOSTPORTS_CHAIN]),
     ]
     for cidr in trusted:
         rules.append(("filter", "INPUT", ["-s", cidr, "-p", "udp", "-m", "udp",

@@ -1,14 +1,21 @@
 """Tests for node-sync's iptables chain handling.
 
-The base ruleset jumps into custom nat chains. Those jumps cannot be added
-before the chains exist, and on a freshly provisioned node they do not — which
-made the FIRST node-sync run on every new node report errors.
+The base ruleset jumps into custom nat chains, and into the custom filter chain
+that carries operator-opened host ports. Those jumps cannot be added before the
+chains exist, and on a freshly provisioned node they do not — which made the
+FIRST node-sync run on every new node report errors.
 """
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import hetzman.commands.node as node
-from hetzman.render import NAT_CUSTOM_CHAINS, render_iptables_base
+from hetzman.render import (
+    FILTER_CUSTOM_CHAINS,
+    NAT_CUSTOM_CHAINS,
+    render_iptables_base,
+)
+
+ALL_CUSTOM_CHAINS = tuple(NAT_CUSTOM_CHAINS) + tuple(FILTER_CUSTOM_CHAINS)
 
 
 def _ok(rc=0):
@@ -33,7 +40,7 @@ def test_constant_matches_the_chains_the_base_ruleset_declares():
         for line in text.splitlines()
         if line.startswith(":HETZMAN")
     }
-    assert declared == set(NAT_CUSTOM_CHAINS)
+    assert declared == set(ALL_CUSTOM_CHAINS)
 
 
 def test_missing_chains_are_created():
@@ -46,10 +53,17 @@ def test_missing_chains_are_created():
         return _ok()
 
     with patch.object(node, "_run", side_effect=fake_run):
-        node._ensure_nat_chains()
+        node._ensure_custom_chains()
 
     created = [c for c in calls if "-N" in c]
-    assert [c[c.index("-N") + 1] for c in created] == list(NAT_CUSTOM_CHAINS)
+    assert [c[c.index("-N") + 1] for c in created] == list(ALL_CUSTOM_CHAINS)
+    # ...and each in the right table, or the chain is created where no rule
+    # jumps into it and the jump still fails.
+    tables = {c[c.index("-N") + 1]: c[c.index("-t") + 1] for c in created}
+    for chain in NAT_CUSTOM_CHAINS:
+        assert tables[chain] == "nat"
+    for chain in FILTER_CUSTOM_CHAINS:
+        assert tables[chain] == "filter"
 
 
 def test_existing_chains_are_left_alone():
@@ -61,7 +75,7 @@ def test_existing_chains_are_left_alone():
         return _ok(0)              # every chain already exists
 
     with patch.object(node, "_run", side_effect=fake_run):
-        node._ensure_nat_chains()
+        node._ensure_custom_chains()
 
     assert not any("-N" in c for c in calls)
 
@@ -78,7 +92,7 @@ def test_chains_are_ensured_before_the_jumps_are_appended():
         return _ok(1) if "-L" in cmd else _ok(0)
 
     with patch.object(node, "_run", side_effect=fake_run):
-        node._ensure_nat_chains()
+        node._ensure_custom_chains()
         # simulate the live-ensure step that follows
         node._run(["iptables", "-w", "5", "-t", "nat", "-A", "PREROUTING", "-j", "HETZMAN_NAT"])
 

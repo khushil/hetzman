@@ -389,3 +389,160 @@ def test_postgres_accept_is_scoped_to_the_private_vswitch():
     for line in lines:
         assert f"-s {VSWITCH_SUBNET}" in line
         assert "0.0.0.0/0" not in line
+
+
+# --- operator-opened host ports -------------------------------------------
+# The mechanism that lets a service on the HOST (here: Perforce p4d) be reached
+# from outside, without hand-editing a file node-sync re-pins at every boot.
+
+
+def test_host_ports_absent_is_byte_identical_to_empty():
+    """The dc12-compatibility guarantee, asserted rather than assumed.
+
+    A peer node with no host-ports key must render exactly what it renders
+    today. Full-string equality, not a substring probe - a stray header or
+    blank line would be invisible to `in` and would drift forever.
+    """
+    self_node, nodes = _self_and_fleet()
+    assert render_iptables_base(self_node, nodes) == \
+        render_iptables_base(self_node, nodes, host_ports=[])
+
+
+def test_host_port_renders_into_its_own_chain_with_a_jump():
+    from hetzman.render import HOSTPORTS_CHAIN
+
+    self_node, nodes = _self_and_fleet()
+    text = render_iptables_base(
+        self_node, nodes,
+        host_ports=[{"port": 1666, "protocol": "tcp", "source": "0.0.0.0/0"}],
+    )
+    assert f":{HOSTPORTS_CHAIN} - [0:0]" in text          # declared...
+    assert f"-A INPUT -j {HOSTPORTS_CHAIN}" in text        # ...jumped into...
+    assert f"-A {HOSTPORTS_CHAIN} -p tcp -m tcp --dport 1666 -j ACCEPT" in text
+    # The chain declaration must precede the jump or iptables-restore rejects it.
+    assert text.index(f":{HOSTPORTS_CHAIN} - [0:0]") < text.index(f"-A INPUT -j {HOSTPORTS_CHAIN}")
+
+
+def test_host_port_jump_is_in_both_the_base_and_the_live_ensure():
+    """Drift tripwire, as for the supernet and postgres accepts.
+
+    Only the JUMP is ensured live; the chain's contents are reconciled by
+    flush-and-rebuild, because -C || -A cannot express removal.
+    """
+    from hetzman.render import HOSTPORTS_CHAIN
+
+    self_node, nodes = _self_and_fleet()
+    assert f"-A INPUT -j {HOSTPORTS_CHAIN}" in render_iptables_base(self_node, nodes)
+    assert ("filter", "INPUT", ["-j", HOSTPORTS_CHAIN]) in base_ensure_rules(self_node, nodes)
+
+
+def test_dns_acl_guard_is_token_matched_not_substring():
+    """Regression: '--dport 53' is a PREFIX of '--dport 5353'.
+
+    With a substring test, opening port 5353 raised RenderError from the :53
+    ACL guard - and a RenderError aborts the entire node-sync run, silently,
+    every 15 minutes. Latent until something could render a 53xx port.
+    """
+    self_node, nodes = _self_and_fleet()
+    for port in (5353, 530, 53000):
+        render_iptables_base(
+            self_node, nodes,
+            host_ports=[{"port": port, "protocol": "udp", "source": "0.0.0.0/0"}],
+        )  # must not raise
+
+
+def test_real_dns_port_still_guarded_after_the_token_fix():
+    """The fix must not have disarmed the guard it was narrowing."""
+    self_node, nodes = _self_and_fleet()
+    with pytest.raises(RenderError):
+        render_iptables_base(self_node, nodes, trusted_dns_clients=["0.0.0.0/0"])
+
+
+def test_lifelines_survive_host_ports():
+    """Host ports must never displace the SSH/lo/conntrack/ICMP lifeline, nor
+    the DROP policy - this box has no console."""
+    from hetzman.render import HOSTPORTS_CHAIN
+
+    self_node, nodes = _self_and_fleet()
+    text = render_iptables_base(
+        self_node, nodes,
+        host_ports=[{"port": 1666, "protocol": "tcp", "source": "0.0.0.0/0"}],
+    )
+    for snippet in (
+        "-A INPUT -p tcp -m tcp --dport 22 -j ACCEPT",
+        "-A INPUT -i lo -j ACCEPT",
+        "-A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT",
+        "-A INPUT -p icmp -m icmp --icmp-type 8 -j ACCEPT",
+        ":INPUT DROP [0:0]",
+    ):
+        assert snippet in text
+    # base_ensure_rules has no `required[]` equivalent of its own - assert here.
+    rules = base_ensure_rules(self_node, nodes)
+    assert ("filter", "INPUT", ["-p", "tcp", "-m", "tcp", "--dport", "22", "-j", "ACCEPT"]) in rules
+    assert ("filter", "INPUT", ["-i", "lo", "-j", "ACCEPT"]) in rules
+    assert ("filter", "INPUT", ["-j", HOSTPORTS_CHAIN]) in rules
+
+
+def test_host_port_ok_accepts_the_public_cidr():
+    """Deliberately UNLIKE dns_acl_source_ok: a host port facing the internet
+    is often the entire point, so 0.0.0.0/0 must validate."""
+    from hetzman.render import host_port_ok
+
+    assert host_port_ok({"port": 1666, "protocol": "tcp", "source": "0.0.0.0/0"})
+    assert host_port_ok({"port": 443, "protocol": "tcp", "source": "10.0.0.0/24"})
+    assert host_port_ok({"port": 1666})                      # defaults tcp / world
+    assert not host_port_ok({"port": 0})
+    assert not host_port_ok({"port": 70000})
+    assert not host_port_ok({"port": 1666, "protocol": "sctp"})
+    assert not host_port_ok({"port": 1666, "source": "not-a-cidr"})
+    assert not host_port_ok({"port": "not-a-port"})
+    assert not host_port_ok("not-a-dict")
+    assert not host_port_ok({})
+
+
+def test_public_source_renders_without_an_explicit_s_match():
+    """iptables-save omits -s for a match-anything source; emitting it
+    literally would differ from what the kernel reports and drift forever."""
+    from hetzman.render import HOSTPORTS_CHAIN
+
+    self_node, nodes = _self_and_fleet()
+    line = [ln for ln in render_iptables_base(
+        self_node, nodes,
+        host_ports=[{"port": 1666, "protocol": "tcp", "source": "0.0.0.0/0"}],
+    ).splitlines() if ln.startswith(f"-A {HOSTPORTS_CHAIN}")][0]
+    assert "-s" not in line
+    # ...but a scoped source must be carried through verbatim.
+    scoped = [ln for ln in render_iptables_base(
+        self_node, nodes,
+        host_ports=[{"port": 1666, "protocol": "tcp", "source": "203.0.113.0/24"}],
+    ).splitlines() if ln.startswith(f"-A {HOSTPORTS_CHAIN}")][0]
+    assert "-s 203.0.113.0/24" in scoped
+
+
+def test_duplicate_host_ports_are_deduplicated_not_raised():
+    """A duplicate must never become a RenderError: that would hand an operator
+    a one-command way to wedge node-sync on a remote box."""
+    from hetzman.render import HOSTPORTS_CHAIN
+
+    self_node, nodes = _self_and_fleet()
+    entry = {"port": 1666, "protocol": "tcp", "source": "0.0.0.0/0"}
+    text = render_iptables_base(self_node, nodes, host_ports=[entry, dict(entry)])
+    assert text.count(f"-A {HOSTPORTS_CHAIN} -p tcp") == 1
+
+
+def test_malformed_entry_reaching_the_renderer_is_a_bug_and_raises():
+    """The backstop. Operator data is filtered upstream in node.py:_host_ports;
+    anything malformed arriving here means that filter was bypassed in code."""
+    self_node, nodes = _self_and_fleet()
+    with pytest.raises(RenderError):
+        render_iptables_base(self_node, nodes, host_ports=[{"port": 99999}])
+
+
+def test_reserved_ports_cover_managed_rules_and_openbao():
+    """Derived from the renderer's own constants so it cannot rot separately."""
+    from hetzman.render import POSTGRES_PORT, reserved_host_ports
+
+    reserved = reserved_host_ports()
+    for port in ("22", "53", "2379", "2380", "8443", POSTGRES_PORT, "8200", "8201"):
+        assert port in reserved
+    assert "1666" not in reserved
